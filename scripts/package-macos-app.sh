@@ -116,7 +116,8 @@ while IFS= read -r -d '' metadata_dir; do
   /bin/rm -R "$metadata_dir"
 done < <(find "$EMBEDDED_PYTHON_ROOT/lib/python3.12/site-packages" \
   -type d -name sboms -print0)
-find "$EMBEDDED_PYTHON_ROOT/bin" -type f ! -name 'python3.12' -delete
+find "$EMBEDDED_PYTHON_ROOT/bin" -mindepth 1 -maxdepth 1 \
+  ! -name 'python3.12' ! -name 'python3' ! -name 'python' -delete
 
 for template in default.md meeting.md lecture.md; do
   /usr/bin/ditto "$ROOT_DIR/templates/$template" \
