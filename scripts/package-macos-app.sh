@@ -78,11 +78,13 @@ WHEEL="$(find "$TMP_DIR/wheels" -maxdepth 1 -type f -name '*.whl' -print -quit)"
 
 "$EMBEDDED_PYTHON" -I -B -m pip install \
   --disable-pip-version-check \
+  --break-system-packages \
   --no-compile \
   --no-cache-dir \
   --requirement "$ROOT_DIR/requirements-runtime.txt"
 "$EMBEDDED_PYTHON" -I -B -m pip install \
   --disable-pip-version-check \
+  --break-system-packages \
   --no-compile \
   --no-cache-dir \
   --no-deps "$WHEEL"
