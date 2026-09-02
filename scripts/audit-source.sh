@@ -76,6 +76,57 @@ for forbidden_dir in .claude .venv .uv data downloads; do
     fi
 done
 
+generated_dirs=""
+while IFS= read -r -d '' candidate; do
+    generated_dirs+="${candidate#"$SOURCE_ROOT"/}"$'\n'
+done < <(
+    find "$SOURCE_ROOT" \
+        -path "$SOURCE_ROOT/.git" -prune -o \
+        -path "$SOURCE_ROOT/dist" -prune -o \
+        -type d \( \
+            -name .build -o \
+            -name .pytest_cache -o \
+            -name .ruff_cache -o \
+            -name .mypy_cache -o \
+            -name .swiftpm -o \
+            -name __pycache__ \
+        \) -print0 -prune
+)
+if [[ -n "$generated_dirs" ]]; then
+    report_paths "Generated build or test cache directories must not ship." "$generated_dirs"
+else
+    pass "No generated build or test cache directories are present."
+fi
+
+unsafe_links=""
+while IFS= read -r -d '' candidate; do
+    relative="${candidate#"$SOURCE_ROOT"/}"
+    raw_target="$(/usr/bin/readlink "$candidate" 2>/dev/null || true)"
+    resolved_target="$(/bin/realpath "$candidate" 2>/dev/null || true)"
+    if [[ "$raw_target" == /* || -z "$resolved_target" ]]; then
+        unsafe_links+="$relative"$'\n'
+        continue
+    fi
+    case "$resolved_target" in
+        "$SOURCE_ROOT"|"$SOURCE_ROOT"/*)
+            ;;
+        *)
+            unsafe_links+="$relative"$'\n'
+            ;;
+    esac
+done < <(
+    find "$SOURCE_ROOT" \
+        -path "$SOURCE_ROOT/.git" -prune -o \
+        -path "$SOURCE_ROOT/dist" -prune -o \
+        -type d \( -name .build -o -name .pytest_cache -o -name .ruff_cache -o -name .mypy_cache -o -name __pycache__ \) -prune -o \
+        -type l -print0
+)
+if [[ -n "$unsafe_links" ]]; then
+    report_paths "Absolute, broken, or source-escaping symbolic links are present." "$unsafe_links"
+else
+    pass "All source symbolic links are relative and remain inside the project."
+fi
+
 state_files=""
 while IFS= read -r -d '' candidate; do
     relative="${candidate#"$SOURCE_ROOT"/}"
@@ -83,7 +134,7 @@ while IFS= read -r -d '' candidate; do
     case "$basename" in
         .env.example)
             ;;
-        .env|.env.*|*.db|*.db-wal|*.db-shm|*.sqlite|*.sqlite3|*.sqlite-wal|*.sqlite-shm|cookies.txt|cookie.txt|*.keychain|*.keychain-db)
+        .env|.env.*|*.db|*.db-wal|*.db-shm|*.sqlite|*.sqlite3|*.sqlite-wal|*.sqlite-shm|cookies.txt|cookie.txt|*.keychain|*.keychain-db|*.pyc|*.pyo|.coverage|.DS_Store)
             state_files+="$relative"$'\n'
             ;;
         *.mp3|*.m4a|*.wav|*.aac|*.opus|*.flac|*.mp4|*.mov)
@@ -93,7 +144,7 @@ while IFS= read -r -d '' candidate; do
 done < <(
     find "$SOURCE_ROOT" \
         -type d \( -name .git -o -name .build -o -name dist -o -name __pycache__ \) -prune -o \
-        -type f -print0
+        \( -type f -o -type l \) -print0
 )
 
 if [[ -n "$state_files" ]]; then
@@ -104,8 +155,9 @@ fi
 
 rg_common=(
     --hidden
+    --no-ignore
     --glob '!.git/**'
-    --glob '!.build/**'
+    --glob '!**/.build/**'
     --glob '!dist/**'
     --glob '!**/__pycache__/**'
     --glob '!scripts/audit-source.sh'
@@ -120,6 +172,23 @@ if [[ -n "$secret_hits" ]]; then
     report_paths "Files contain values matching high-confidence credential formats (contents withheld)." "$secret_hits"
 else
     pass "No high-confidence plaintext credentials were detected."
+fi
+
+# Plaud credentials can also be opaque values that do not resemble common API
+# token formats. Scan production source and documentation for literal values;
+# dynamic expressions and test fixtures remain allowed.
+plaud_literal_pattern='PLAUD_(AUTHORIZATION|COOKIE|X_DEVICE_ID|X_PLD_USER)[^:=]{0,4}[:=][[:space:]]*["](([Bb]earer[[:space:]]+[A-Za-z0-9][A-Za-z0-9._~+/=-]{11,})|[a-z0-9][A-Za-z0-9._~+/=-]{11,})|([Aa]uthorization|[Cc]ookie|x-device-id|x-pld-user)[^:=]{0,6}:[[:space:]]*["](([Bb]earer[[:space:]]+[A-Za-z0-9][A-Za-z0-9._~+/=-]{11,})|[a-z0-9][A-Za-z0-9._~+/=-]{11,})'
+plaud_literal_hits="$(
+    cd "$SOURCE_ROOT" && \
+    rg -l -e "$plaud_literal_pattern" \
+        "${rg_common[@]}" \
+        --glob '!tests/**' \
+        . 2>/dev/null || true
+)"
+if [[ -n "$plaud_literal_hits" ]]; then
+    report_paths "Production files contain plausible literal Plaud credentials (contents withheld)." "$plaud_literal_hits"
+else
+    pass "No plausible literal Plaud credential assignments were detected in production files."
 fi
 
 # Keep the audit source itself out of this scan so the deny-list does not flag

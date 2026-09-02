@@ -58,6 +58,29 @@ echo "Auditing macOS release: $APP_PATH"
 [[ -f "$RUNTIME/templates/lecture.md" ]] || die "Lecture template is missing."
 pass "Required bundle resources are present."
 
+unsafe_links=""
+while IFS= read -r -d '' candidate; do
+    relative="${candidate#"$APP_PATH"/}"
+    raw_target="$(/usr/bin/readlink "$candidate" 2>/dev/null || true)"
+    resolved_target="$(/bin/realpath "$candidate" 2>/dev/null || true)"
+    if [[ "$raw_target" == /* || -z "$resolved_target" ]]; then
+        unsafe_links+="$relative"$'\n'
+        continue
+    fi
+    case "$resolved_target" in
+        "$APP_PATH"|"$APP_PATH"/*)
+            ;;
+        *)
+            unsafe_links+="$relative"$'\n'
+            ;;
+    esac
+done < <(find "$CONTENTS" -type l -print0)
+if [[ -n "$unsafe_links" ]]; then
+    printf '%s' "$unsafe_links" | /usr/bin/sed 's/^/       /' >&2
+    die "Absolute, broken, or bundle-escaping symbolic links are present."
+fi
+pass "All bundle symbolic links are relative and remain inside the app."
+
 plist_value() {
     /usr/libexec/PlistBuddy -c "Print :$1" "$INFO_PLIST" 2>/dev/null || true
 }
@@ -144,7 +167,7 @@ while IFS= read -r -d '' candidate; do
             forbidden_files+="$relative"$'\n'
             ;;
     esac
-done < <(find "$CONTENTS" -type f -print0)
+done < <(find "$CONTENTS" \( -type f -o -type l \) -print0)
 if [[ -n "$forbidden_files" ]]; then
     printf '%s' "$forbidden_files" | /usr/bin/sed 's/^/       /' >&2
     die "Private state or non-relocatable Python artifacts are bundled."
@@ -188,6 +211,25 @@ if [[ -n "$secret_hits" ]]; then
     die "A bundled application file matches a high-confidence credential format (contents withheld)."
 fi
 pass "No personal build paths or high-confidence plaintext credentials were detected."
+
+plaud_literal_pattern='PLAUD_(AUTHORIZATION|COOKIE|X_DEVICE_ID|X_PLD_USER)[^:=]{0,4}[:=][[:space:]]*["](([Bb]earer[[:space:]]+[A-Za-z0-9][A-Za-z0-9._~+/=-]{11,})|[a-z0-9][A-Za-z0-9._~+/=-]{11,})|([Aa]uthorization|[Cc]ookie|x-device-id|x-pld-user)[^:=]{0,6}:[[:space:]]*["](([Bb]earer[[:space:]]+[A-Za-z0-9][A-Za-z0-9._~+/=-]{11,})|[a-z0-9][A-Za-z0-9._~+/=-]{11,})'
+plaud_literal_hits=""
+for scan_target in "${scan_targets[@]}"; do
+    if [[ -d "$scan_target" ]]; then
+        while IFS= read -r -d '' candidate; do
+            if /usr/bin/grep -aEq "$plaud_literal_pattern" "$candidate" 2>/dev/null; then
+                plaud_literal_hits+="$candidate"$'\n'
+            fi
+        done < <(find "$scan_target" -type f -print0)
+    elif /usr/bin/grep -aEq "$plaud_literal_pattern" "$scan_target" 2>/dev/null; then
+        plaud_literal_hits+="$scan_target"$'\n'
+    fi
+done
+if [[ -n "$plaud_literal_hits" ]]; then
+    printf '%s\n' "$plaud_literal_hits" | /usr/bin/sed 's/^/       /' >&2
+    die "A bundled production file contains a plausible literal Plaud credential (contents withheld)."
+fi
+pass "No opaque Plaud authorization, cookie, device, or user credential literals were detected."
 
 template_inventory="$(find "$RUNTIME/templates" -maxdepth 1 -type f -name '*.md' -exec basename {} \; | LC_ALL=C sort)"
 expected_templates=$'default.md\nlecture.md\nmeeting.md'

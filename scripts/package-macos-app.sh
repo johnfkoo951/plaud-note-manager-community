@@ -17,6 +17,7 @@ STAGE_APP="$TMP_DIR/$APP_NAME.app"
 STAGE_ZIP="$TMP_DIR/$APP_NAME-$VERSION-macOS-arm64.zip"
 FINAL_APP="$DIST_DIR/$APP_NAME.app"
 FINAL_ZIP="$DIST_DIR/$APP_NAME-$VERSION-macOS-arm64.zip"
+SWIFT_SCRATCH="$TMP_DIR/swift-build"
 
 cleanup() {
   if [[ -n "${TMP_DIR:-}" && "$TMP_DIR" == *plaud-community-package.* ]]; then
@@ -49,14 +50,20 @@ mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Resources/runtime/temp
 echo "Building Swift application..."
 swift build \
   --package-path "$ROOT_DIR/app" \
+  --scratch-path "$SWIFT_SCRATCH" \
   -c release \
   -Xswiftc -gnone \
   -Xswiftc -file-prefix-map \
   -Xswiftc "$ROOT_DIR=/SOURCE/plaud-note-manager-community" \
   -Xswiftc -debug-prefix-map \
-  -Xswiftc "$ROOT_DIR=/SOURCE/plaud-note-manager-community"
+  -Xswiftc "$ROOT_DIR=/SOURCE/plaud-note-manager-community" \
+  -Xswiftc -file-prefix-map \
+  -Xswiftc "$TMP_DIR=/BUILD" \
+  -Xswiftc -debug-prefix-map \
+  -Xswiftc "$TMP_DIR=/BUILD"
 
-BIN_DIR="$(swift build --package-path "$ROOT_DIR/app" -c release --show-bin-path)"
+BIN_DIR="$(swift build --package-path "$ROOT_DIR/app" --scratch-path "$SWIFT_SCRATCH" \
+  -c release --show-bin-path)"
 BUILD_BINARY="$BIN_DIR/$EXECUTABLE_NAME"
 [[ -x "$BUILD_BINARY" ]] || fail "build binary not found: $BUILD_BINARY"
 /usr/bin/ditto "$BUILD_BINARY" "$STAGE_APP/Contents/MacOS/$EXECUTABLE_NAME"
@@ -69,6 +76,17 @@ done < <(find "$BIN_DIR" -maxdepth 1 -type d -name '*.bundle' -print | sort)
 echo "Embedding an isolated Python runtime..."
 /usr/bin/ditto "$PYTHON_HOME" "$STAGE_APP/Contents/Resources/python"
 EMBEDDED_PYTHON="$STAGE_APP/Contents/Resources/python/bin/python3"
+EMBEDDED_PYTHON_ROOT="$STAGE_APP/Contents/Resources/python"
+
+# The uv-managed CPython build is relocatable at runtime, but its dylib ID and
+# sysconfig build metadata remember the build user's installation prefix.
+# Rewrite those values in the private bundle copy before code signing.
+/usr/bin/install_name_tool -id '@rpath/libpython3.12.dylib' \
+  "$EMBEDDED_PYTHON_ROOT/lib/libpython3.12.dylib"
+SYSCONFIG_DATA="$EMBEDDED_PYTHON_ROOT/lib/python3.12/_sysconfigdata__darwin_darwin.py"
+if [[ -f "$SYSCONFIG_DATA" ]]; then
+  /usr/bin/sed -i '' "s#$PYTHON_HOME#/opt/plaud-community-python#g" "$SYSCONFIG_DATA"
+fi
 
 mkdir -p "$TMP_DIR/wheels"
 UV_CACHE_DIR="${UV_CACHE_DIR:-$TMP_DIR/uv-cache}" uv build \
@@ -94,6 +112,11 @@ find "$STAGE_APP/Contents/Resources/python" -type f \
 find "$STAGE_APP/Contents/Resources/python" -type d -name '__pycache__' -empty -delete
 find "$STAGE_APP/Contents/Resources/python" -type f \
   \( -name '*.pth' -o -name 'sitecustomize.py' -o -name 'usercustomize.py' \) -delete
+while IFS= read -r -d '' metadata_dir; do
+  /bin/rm -R "$metadata_dir"
+done < <(find "$EMBEDDED_PYTHON_ROOT/lib/python3.12/site-packages" \
+  -type d -name sboms -print0)
+find "$EMBEDDED_PYTHON_ROOT/bin" -type f ! -name 'python3.12' -delete
 
 for template in default.md meeting.md lecture.md; do
   /usr/bin/ditto "$ROOT_DIR/templates/$template" \
@@ -106,7 +129,7 @@ if [[ -f "$PYTHON_HOME/LICENSE" ]]; then
   /usr/bin/ditto "$PYTHON_HOME/LICENSE" \
     "$STAGE_APP/Contents/Resources/runtime/PYTHON_LICENSE"
 fi
-GRDB_LICENSE="$ROOT_DIR/app/.build/checkouts/GRDB.swift/LICENSE"
+GRDB_LICENSE="$SWIFT_SCRATCH/checkouts/GRDB.swift/LICENSE"
 if [[ -f "$GRDB_LICENSE" ]]; then
   /usr/bin/ditto "$GRDB_LICENSE" \
     "$STAGE_APP/Contents/Resources/runtime/GRDB_LICENSE"

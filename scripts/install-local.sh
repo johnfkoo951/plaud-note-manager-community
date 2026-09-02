@@ -26,6 +26,8 @@ die() {
 [[ -e "$SOURCE" ]] || die "Release artifact does not exist: $SOURCE"
 [[ -f "$AUDIT_SCRIPT" ]] || die "Release audit script is missing: $AUDIT_SCRIPT"
 
+source_quarantine_hex="$(/usr/bin/xattr -px com.apple.quarantine "$SOURCE" 2>/dev/null || true)"
+
 if [[ -e "$INSTALL_DIR" && ! -d "$INSTALL_DIR" ]]; then
     die "Install location exists but is not a directory: $INSTALL_DIR"
 fi
@@ -71,7 +73,7 @@ case "$SOURCE" in
         [[ -f "$SOURCE" ]] || die "The zip artifact is not a file: $SOURCE"
         extract_dir="$work_dir/extracted"
         mkdir -p "$extract_dir"
-        /usr/bin/ditto -x -k "$SOURCE" "$extract_dir"
+        /usr/bin/env -u DITTONORSRC /usr/bin/ditto -x -k --rsrc --extattr --qtn "$SOURCE" "$extract_dir"
         source_app="$extract_dir/$APP_NAME.app"
         [[ -d "$source_app" ]] || die "Zip does not contain '$APP_NAME.app' at its top level."
         ;;
@@ -80,14 +82,26 @@ case "$SOURCE" in
         ;;
 esac
 
+if [[ -z "$source_quarantine_hex" ]]; then
+    source_quarantine_hex="$(/usr/bin/xattr -px com.apple.quarantine "$source_app" 2>/dev/null || true)"
+fi
+
 # ditto preserves bundle metadata and extended attributes. In particular, this
 # installer never removes com.apple.quarantine or bypasses Gatekeeper.
-/usr/bin/ditto "$source_app" "$staged_app"
+/usr/bin/env -u DITTONORSRC /usr/bin/ditto --rsrc --extattr --qtn "$source_app" "$staged_app"
+if [[ -n "$source_quarantine_hex" ]]; then
+    /usr/bin/xattr -wx com.apple.quarantine "$source_quarantine_hex" "$staged_app"
+fi
 
 echo "Validating the exact staged copy..."
 # Do not execute a quarantined nested binary before Finder has completed the
 # user's first-open consent. The build-time release audit still runs CLI help.
-SKIP_EMBEDDED_CLI=1 /bin/bash "$AUDIT_SCRIPT" "$staged_app"
+if /usr/bin/xattr -p com.apple.quarantine "$staged_app" >/dev/null 2>&1; then
+    skip_embedded_cli=1
+else
+    skip_embedded_cli=0
+fi
+SKIP_EMBEDDED_CLI="$skip_embedded_cli" /bin/bash "$AUDIT_SCRIPT" "$staged_app"
 
 if [[ -e "$DESTINATION" || -L "$DESTINATION" ]]; then
     timestamp="$(/bin/date '+%Y%m%d-%H%M%S')"
