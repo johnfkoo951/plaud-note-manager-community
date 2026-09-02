@@ -42,7 +42,7 @@ if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 PYTHON_BIN="$(uv python find 3.12)"
-PYTHON_HOME="$(cd "$(dirname "$PYTHON_BIN")/.." && pwd)"
+PYTHON_HOME="$(cd "$(dirname "$PYTHON_BIN")/.." && pwd -P)"
 [[ -x "$PYTHON_HOME/bin/python3" ]] || fail "uv-managed Python 3.12 was not found"
 
 mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Resources/runtime/templates"
