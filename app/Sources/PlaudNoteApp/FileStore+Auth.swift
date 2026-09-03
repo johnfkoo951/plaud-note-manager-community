@@ -165,7 +165,7 @@ extension FileStore {
     }
 
     /// Tier-1 recovery via `plaud auth-recover`: re-harvest workspaceList from
-    /// a live web.plaud.ai session in the cmux browser — no password entry.
+    /// a live web.plaud.ai session in Chrome — no password entry.
     /// Used when even the headless refresh chain is broken (rejected /
     /// not_bootstrapped). Falls back to the Web Login flow on failure.
     @discardableResult
@@ -198,7 +198,7 @@ extension FileStore {
             return true
         case "no_session":
             lastCommandError =
-                "브라우저에 web.plaud.ai 로그인 세션이 없습니다 — Chrome(또는 cmux)에서 로그인한 뒤 다시 시도하거나, 아래 Web Login을 사용해 주세요."
+                "브라우저에 web.plaud.ai 로그인 세션이 없습니다 — Chrome에서 로그인한 뒤 다시 시도하거나, 아래 Web Login을 사용해 주세요."
             return false
         case "chrome_js_disabled":
             lastCommandError =
@@ -206,7 +206,7 @@ extension FileStore {
             return false
         case "driver_unavailable":
             lastCommandError =
-                "제어 가능한 브라우저(Chrome/cmux)가 없습니다 — Web Login으로 로그인해 주세요. (\(detail))"
+                "제어 가능한 브라우저(Chrome)가 없습니다 — Web Login으로 로그인해 주세요. (\(detail))"
             return false
         default:
             let suffix = detail.isEmpty ? "" : " — \(detail)"

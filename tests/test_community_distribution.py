@@ -18,7 +18,10 @@ def test_community_edition_blocks_private_or_external_commands(argv: list[str]) 
     result = CliRunner().invoke(app, argv)
 
     assert result.exit_code == 2
-    assert "Unavailable in the Community edition" in result.stdout
+    # Handlers whose modules were deleted are gone entirely (typer reports
+    # "No such command"); remaining private commands are refused by the guard.
+    combined = result.stdout + (result.stderr or "") + str(result.output)
+    assert "Unavailable in the Community edition" in combined or "No such command" in combined
 
 
 def test_community_edition_keeps_local_paths_command_available() -> None:

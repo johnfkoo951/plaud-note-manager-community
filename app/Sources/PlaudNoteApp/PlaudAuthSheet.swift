@@ -93,7 +93,7 @@ struct PlaudAuthSheet: View {
             }
             Text(
                 recoverStatus
-                    ?? "Tries an existing Chrome/cmux Plaud session. The app-owned session is already retried automatically before this screen appears."
+                    ?? "Tries an existing Chrome Plaud session. The app-owned session is already retried automatically before this screen appears."
             )
             .font(AppUI.metaFont)
             .foregroundStyle(recoverStatus == nil ? .secondary : Color.primary)
