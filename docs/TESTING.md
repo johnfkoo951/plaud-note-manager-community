@@ -40,7 +40,7 @@ The packaged Windows native self-test must run on Windows 11 x64. It checks the 
 ## Live gates that require a test Plaud account
 
 - first Web Login on a fresh macOS user
-- first cURL import on a fresh Windows user
+- first cURL import on a fresh macOS user and a fresh Windows user
 - metadata sync, one detail fetch, search, playback, and export
 - token refresh after the access token approaches expiry
 - Community app cannot see the private edition's Keychain, DB, or WebKit session
@@ -59,15 +59,15 @@ Do not mark live gates complete based only on unit tests or a successful build.
 - Windows Authenticode signature and reputation
 - actual Intel Mac GUI and actual Windows 11 participant-machine E2E
 
-## Current source-gate result — 2026-09-03
+## Current source-gate result — 0.2.2, 2026-09-03
 
-- Python tests: 215 passed
+- Python tests: 288 passed
 - Ruff check/format: passed
 - JavaScript syntax check: passed
-- Swift arm64 release build, macOS minimum 14.0: passed
-- Swift x86_64 release build, macOS minimum 14.0: passed
-- Source privacy scan: passed
-- Gitleaks 8.30.1 working-tree scan: no leaks found
+- Swift app tests: 9 passed
+- Swift arm64 and x86_64 release builds, macOS minimum 14.0: passed through the package pipeline
+- Source privacy scan: passed on a source-only snapshot
+- Gitleaks source snapshot scan: no leaks found
 - Packaged artifact audits and SHA-256: recorded next to the generated ZIPs in `dist/RELEASE-REPORT.md`
 - Windows x64 native HTTP/DPAPI self-test: workflow and packaged diagnostic prepared; not run on Windows in this local session
 - Live Plaud E2E: requires a fresh user and a dedicated test account

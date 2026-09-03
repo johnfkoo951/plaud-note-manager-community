@@ -204,6 +204,18 @@ class CommunityRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 service.export(str(body.get("file_id", "")), str(body.get("kind", ""))),
             )
+        elif path == "/api/usage-status":
+            _require_exact_fields(body, "file_id", "usage_status")
+            self._json(
+                HTTPStatus.OK,
+                service.set_usage_status(body["file_id"], body["usage_status"]),
+            )
+        elif path == "/api/tag-add":
+            _require_exact_fields(body, "file_id", "tag")
+            self._json(HTTPStatus.OK, service.add_tag(body["file_id"], body["tag"]))
+        elif path == "/api/tag-remove":
+            _require_exact_fields(body, "file_id", "tag")
+            self._json(HTTPStatus.OK, service.remove_tag(body["file_id"], body["tag"]))
         elif path == "/api/shutdown":
             self._json(HTTPStatus.OK, service.prepare_shutdown())
             threading.Thread(
@@ -311,6 +323,16 @@ def _one(query: dict[str, list[str]], key: str, default: str) -> str:
     if len(values) != 1:
         raise ServiceError("invalid_parameter", f"{key} 값은 하나만 허용됩니다.")
     return values[0]
+
+
+def _require_exact_fields(body: dict[str, Any], *fields: str) -> None:
+    """Fail closed when a local-write payload is missing or adds capabilities."""
+
+    if set(body) != set(fields):
+        raise ServiceError(
+            "invalid_fields",
+            "요청 항목이 올바르지 않습니다.",
+        )
 
 
 def create_server(service: Any, *, session_token: str | None = None) -> CommunityHTTPServer:

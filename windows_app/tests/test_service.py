@@ -2,17 +2,16 @@ from __future__ import annotations
 
 import inspect
 import json
-import sqlite3
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from windows_app.service import CommunityService, ServiceError
+from core.storage import Storage
+from windows_app.service import CommunityService, ServiceError, USAGE_STATUSES
 
 
 @dataclass
@@ -22,80 +21,50 @@ class AppPaths:
     env_file: Path
 
 
-class ReadStorage:
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
-
-    @contextmanager
-    def _connect(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-        finally:
-            conn.close()
-
-    def counts(self):
-        with self._connect() as conn:
-            total = conn.execute("SELECT COUNT(*) FROM files WHERE is_trash = 0").fetchone()[0]
-            cached = conn.execute("SELECT COUNT(*) FROM file_content").fetchone()[0]
-        return {"total": total, "trash": 0, "folders": 1, "cached": cached}
-
-    def get_file_row(self, file_id):
-        with self._connect() as conn:
-            return conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
-
-    def get_content_row(self, file_id):
-        with self._connect() as conn:
-            return conn.execute(
-                "SELECT * FROM file_content WHERE file_id = ?", (file_id,)
-            ).fetchone()
-
-    def search_recordings(self, query, *, limit):
-        if query == "회의":
-            return [{"file_id": "rec-1", "snippet": "회의에서 결정한 내용"}]
-        return []
-
-
 def _read_storage(tmp_path):
-    db = tmp_path / "plaud.db"
-    conn = sqlite3.connect(db)
-    conn.executescript(
-        """
-        CREATE TABLE files (
-            id TEXT PRIMARY KEY, filename TEXT, duration REAL, edit_time INTEGER,
-            start_time INTEGER, is_trash INTEGER, starred INTEGER
-        );
-        CREATE TABLE file_content (
-            file_id TEXT PRIMARY KEY, title TEXT, transcript TEXT, outline TEXT,
-            summary_md TEXT, summary_extra TEXT, keywords TEXT, fetched_at INTEGER
-        );
-        CREATE TABLE file_folders (file_id TEXT, folder_id TEXT);
-        CREATE TABLE folders (id TEXT PRIMARY KEY, name TEXT);
-        INSERT INTO files VALUES ('rec-1', '참가자 회의', 125, 1700000000, 1699999000, 0, 0);
-        INSERT INTO folders VALUES ('folder-1', '업무');
-        INSERT INTO file_folders VALUES ('rec-1', 'folder-1');
-        """
-    )
-    conn.execute(
-        "INSERT INTO file_content VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            "rec-1",
-            "참가자 회의",
-            json.dumps(
-                [{"start_time": 0, "end_time": 1000, "speaker": "A", "content": "안녕하세요"}],
-                ensure_ascii=False,
+    storage = Storage(tmp_path / "plaud.db")
+    with storage._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO files
+                (id, filename, duration, edit_time, start_time, is_trash,
+                 status, starred, synced_at, updated_at)
+            VALUES ('rec-1', '참가자 회의', 125, 1700000000, 1699999000,
+                    0, 'new', 0, 1700000100, 1700000100)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO folders (id, name, icon, color, synced_at)
+            VALUES ('folder-1', '업무', NULL, NULL, 1700000100)
+            """
+        )
+        conn.execute("INSERT INTO file_folders VALUES ('rec-1', 'folder-1')")
+        conn.execute(
+            "INSERT INTO file_content VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "rec-1",
+                "참가자 회의",
+                json.dumps(
+                    [
+                        {
+                            "start_time": 0,
+                            "end_time": 1000,
+                            "speaker": "A",
+                            "content": "안녕하세요",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                json.dumps([{"start_time": 0, "end_time": 1000, "topic": "시작"}]),
+                "결정 사항",
+                json.dumps(["추가 노트"], ensure_ascii=False),
+                json.dumps(["회의"], ensure_ascii=False),
+                1700000100,
             ),
-            json.dumps([{"start_time": 0, "end_time": 1000, "topic": "시작"}]),
-            "결정 사항",
-            json.dumps(["추가 노트"], ensure_ascii=False),
-            json.dumps(["회의"], ensure_ascii=False),
-            1700000100,
-        ),
-    )
-    conn.commit()
-    conn.close()
-    return ReadStorage(db)
+        )
+    storage.rebuild_search_index()
+    return storage
 
 
 def _paths(tmp_path):
@@ -120,12 +89,93 @@ def test_local_library_recording_search_and_export(tmp_path):
     recording = service.recording("rec-1")
     assert recording["content"]["summary"] == "결정 사항"
     assert recording["content"]["transcript"][0]["content"] == "안녕하세요"
+    assert recording["local_metadata"] == {
+        "usage_status": "unused",
+        "usage_statuses": list(USAGE_STATUSES),
+        "tags": [],
+        "storage": "local-only",
+    }
     assert service.search("회의")["items"][0]["id"] == "rec-1"
 
     exported = service.export("rec-1", "transcript")
     target = _paths(tmp_path).export_dir / exported["file"]
     assert target.parent == (tmp_path / "exports")
     assert "안녕하세요" in target.read_text(encoding="utf-8")
+
+
+def test_local_usage_status_and_manual_tags_never_call_plaud_cloud(tmp_path):
+    storage = _read_storage(tmp_path)
+
+    def cloud_client_must_not_run(config):
+        raise AssertionError("local metadata attempted to create a Plaud client")
+
+    service = CommunityService(
+        _paths(tmp_path),
+        storage_factory=lambda: storage,
+        client_factory=cloud_client_must_not_run,
+        auth_loader=_auth,
+    )
+
+    for usage_status in USAGE_STATUSES:
+        result = service.set_usage_status("rec-1", usage_status)
+        assert result["usage_status"] == usage_status
+        assert result["storage"] == "local-only"
+
+    result = service.add_tag("rec-1", "#연구 계획")
+    assert result["tags"] == ["연구-계획"]
+    service.add_tag("rec-1", "연구 계획")  # idempotent duplicate
+    assert [row["source"] for row in storage.list_note_tags("rec-1")] == ["manual"]
+
+    result = service.remove_tag("rec-1", "연구 계획")
+    assert result["tags"] == []
+
+
+@pytest.mark.parametrize(
+    "usage_status",
+    [None, 1, "", "drafted", "metadata-ready ", "METADATA-READY"],
+)
+def test_local_usage_status_rejects_values_outside_the_five_states(tmp_path, usage_status):
+    service = CommunityService(
+        _paths(tmp_path), storage_factory=lambda: _read_storage(tmp_path), auth_loader=_auth
+    )
+    with pytest.raises(ServiceError) as exc_info:
+        service.set_usage_status("rec-1", usage_status)
+    assert exc_info.value.code == "invalid_usage_status"
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [None, 1, "", "   ", "one,two", "bad\ntag", "가" * 65],
+)
+def test_local_tag_write_rejects_ambiguous_or_oversized_input(tmp_path, tag):
+    storage = _read_storage(tmp_path)
+    service = CommunityService(_paths(tmp_path), storage_factory=lambda: storage, auth_loader=_auth)
+    with pytest.raises(ServiceError) as exc_info:
+        service.add_tag("rec-1", tag)
+    assert exc_info.value.code == "invalid_tag"
+    assert storage.list_note_tags("rec-1") == []
+
+
+@pytest.mark.parametrize("file_id", [None, 7, "", "../rec-1", "missing"])
+def test_local_metadata_writes_require_an_active_known_recording(tmp_path, file_id):
+    storage = _read_storage(tmp_path)
+    service = CommunityService(_paths(tmp_path), storage_factory=lambda: storage, auth_loader=_auth)
+    with pytest.raises(ServiceError) as exc_info:
+        service.set_usage_status(file_id, "archived")
+    expected = "not_found" if file_id == "missing" else "invalid_file_id"
+    assert exc_info.value.code == expected
+
+
+def test_local_metadata_writes_reject_trashed_recordings(tmp_path):
+    storage = _read_storage(tmp_path)
+    with storage._connect() as conn:
+        conn.execute("UPDATE files SET is_trash = 1 WHERE id = 'rec-1'")
+    service = CommunityService(_paths(tmp_path), storage_factory=lambda: storage, auth_loader=_auth)
+
+    with pytest.raises(ServiceError) as exc_info:
+        service.add_tag("rec-1", "private")
+    assert exc_info.value.code == "not_found"
+    assert exc_info.value.status == 404
 
 
 class WriteStorage:
@@ -323,7 +373,7 @@ def test_default_curl_import_requires_live_validation():
     assert "validate_live=True" in source
 
 
-def test_curl_live_rejection_and_unreachable_are_distinct(tmp_path):
+def test_curl_live_rejection_and_unreachable_both_fail_closed(tmp_path):
     paths = _paths(tmp_path)
     rejected = CommunityService(
         paths,
@@ -344,7 +394,9 @@ def test_curl_live_rejection_and_unreachable_are_distinct(tmp_path):
             status="live_check_unavailable", cookie_captured=True
         ),
     )
-    result = unreachable.import_curl("curl while network is unavailable")
-    assert result["status"] == "connected_unverified"
-    assert result["verification"] == "unreachable"
-    assert "curl while" not in json.dumps(result)
+    with pytest.raises(ServiceError) as exc_info:
+        unreachable.import_curl("curl while network is unavailable")
+    assert exc_info.value.code == "live_check_unavailable"
+    assert exc_info.value.status == 503
+    assert "저장하지 않았습니다" in exc_info.value.message
+    assert "curl while" not in exc_info.value.message

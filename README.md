@@ -11,11 +11,13 @@ Plaud 녹음 목록과 Plaud가 생성한 전사·요약을 동기화하고 로�
 - 녹음 메타데이터 동기화
 - 사용자가 직접 시작하는 전사·요약 캐시 가져오기
 - 로컬 검색과 Markdown 내보내기
+- Plaud Cloud에 쓰지 않는 5단계 사용 상태와 수동 태그
 - Plaud Cloud 데이터를 읽는 핵심 흐름
 
 macOS판에만 포함:
 
 - 앱 안의 Plaud Web Login과 전용 WebKit 세션
+- Web Login이 멈추거나 SSO가 호환되지 않을 때 쓰는 클립보드/직접 붙여넣기 cURL 폴백
 - 재생, 로컬 별표, 명시적으로 실행하는 폴더·제목 정리
 - 갱신용 정보가 확보된 경우 만료 전 토큰 갱신
 
@@ -32,6 +34,7 @@ Windows Community Lite판의 경계:
 - Obsidian/개인 볼트 연동
 - Chrome 프로필·쉘 설정·호스트 API 키 탐색
 - 로그인 직후 전체 라이브러리 자동 백필
+- AI 기반 자동 폴더 분류·자동 이동
 
 ## 개인정보 경계
 
@@ -44,6 +47,7 @@ Windows Community Lite판의 경계:
 - Plaud API 호스트는 HTTPS `api*.plaud.ai`만 허용하고 API 요청은 리디렉션을 따라가지 않습니다.
 
 자세한 내용은 [개인정보 안내](docs/PRIVACY-KR.md)와 [삭제 안내](docs/UNINSTALL-KR.md)를 확인하세요.
+선택형 Chrome 인증 브리지의 후속 설계와 검증 조건은 [제안서](docs/CHROME-AUTH-BRIDGE-PROPOSAL.md)에 분리했습니다.
 
 ## 설치
 
@@ -58,10 +62,11 @@ macOS에서는 ZIP을 풀고 앱을 `응용 프로그램` 폴더로 옮깁니다
 
 ## 첫 사용
 
-1. macOS는 앱의 **Plaud Web Login**으로 로그인합니다. Windows는 안내에 따라 Plaud API cURL을 복사해 로컬 화면에 붙여 넣습니다.
+1. macOS는 앱의 **Plaud Web Login**으로 로그인합니다. 내장 로그인이 멈추면 같은 인증 창의 **Import Copied cURL** 또는 수동 붙여넣기를 사용합니다. Windows는 안내에 따라 Plaud API cURL을 복사해 로컬 화면에 붙여 넣습니다.
 2. **Sync**로 녹음 목록만 먼저 가져옵니다.
 3. 필요한 경우에만 **Backfill**을 눌러 Plaud 전사·요약을 로컬에 캐시합니다.
 4. 검색창에서 제목·전사·요약을 검색합니다.
+5. 녹음별 사용 상태와 수동 태그는 Community 전용 로컬 DB에서 정리합니다.
 
 Backfill은 계정의 아직 캐시되지 않은 전사·요약을 컴퓨터에 내려받습니다. 공용 컴퓨터에서는 사용하지 마세요.
 

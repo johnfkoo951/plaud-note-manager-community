@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import time
 
+import httpx
+import pytest
 from typer.testing import CliRunner
 
+import core.client as client_mod
 import core.web_auth as web_auth_mod
 import core.auth_status as auth_status_mod
 from cli.main import app
@@ -39,9 +42,16 @@ def _fake_client(record: dict, *, error: Exception | None = None):
     """Stand-in for PlaudClient that records the candidate config it was given."""
 
     class FakeClient:
-        def __init__(self, cfg, *, timeout: float = 30.0) -> None:
+        def __init__(
+            self,
+            cfg,
+            *,
+            timeout: float = 30.0,
+            record_auth_rejections: bool = True,
+        ) -> None:
             record["authorization"] = cfg.authorization
             record["timeout"] = timeout
+            record["record_auth_rejections"] = record_auth_rejections
 
         def __enter__(self) -> "FakeClient":
             return self
@@ -296,6 +306,7 @@ def test_default_live_validator_probes_candidate_credentials(tmp_path, monkeypat
     # The probe must see the candidate credentials in memory — never .env.
     assert record["authorization"] == "Bearer candidate.token.value"
     assert record["timeout"] == 10.0
+    assert record["record_auth_rejections"] is False
     assert record["limit"] == 1
 
 
@@ -337,6 +348,57 @@ def test_default_live_validator_maps_network_error_to_unreachable(tmp_path, monk
 
     assert result.status == "live_check_unavailable"
     assert env_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("probe_kind", "expected_verdict"),
+    [
+        ("http_rejected", "rejected"),
+        ("business_rejected", "rejected"),
+        ("unreachable", "unreachable"),
+    ],
+)
+@pytest.mark.parametrize("preexisting_memo", [False, True], ids=["absent", "existing"])
+def test_candidate_live_probe_never_mutates_active_rejection_memo(
+    probe_kind: str,
+    expected_verdict: str,
+    preexisting_memo: bool,
+    monkeypatch,
+) -> None:
+    memo_path = auth_status_mod.REJECTION_FILE
+    original = b'{"rejected_at":123,"status":-419}\n'
+    if preexisting_memo:
+        memo_path.write_bytes(original)
+
+    real_httpx_client = client_mod.httpx.Client
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if probe_kind == "http_rejected":
+            return httpx.Response(401, request=request)
+        if probe_kind == "business_rejected":
+            return httpx.Response(
+                200,
+                request=request,
+                json={"status": -419, "msg": "candidate expired"},
+            )
+        raise httpx.ConnectError("candidate probe offline", request=request)
+
+    def mock_client(**kwargs):
+        return real_httpx_client(transport=httpx.MockTransport(respond), **kwargs)
+
+    monkeypatch.setattr(client_mod.httpx, "Client", mock_client)
+    verdict = web_auth_mod._default_live_validator(
+        {
+            "PLAUD_AUTHORIZATION": "Bearer candidate.token.value",
+            "PLAUD_X_DEVICE_ID": "candidate-device",
+        }
+    )
+
+    assert verdict == expected_verdict
+    if preexisting_memo:
+        assert memo_path.read_bytes() == original
+    else:
+        assert not memo_path.exists()
 
 
 def test_import_web_auth_reports_write_failure_with_cookie_flag(tmp_path) -> None:
@@ -413,7 +475,8 @@ def test_web_auth_cli_non_json_invalid_payload_exits_1(tmp_path, monkeypatch) ->
 def test_import_web_auth_arms_headless_refresh_from_workspace_list(tmp_path, monkeypatch) -> None:
     _clear_auth_env(monkeypatch)
     env_path = tmp_path / ".env"
-    auth_jwt = _make_jwt({"exp": int(time.time()) + 86_400, "wid": "ws_abc"})
+    now = int(time.time())
+    auth_jwt = _make_jwt({"exp": now + 86_400, "wid": "ws_abc"})
 
     result = import_web_auth(
         {
@@ -421,7 +484,13 @@ def test_import_web_auth_arms_headless_refresh_from_workspace_list(tmp_path, mon
             "x_device_id": "device-from-webkit",
             "x_pld_user": "user-from-webkit",
             "workspace_list": json.dumps(
-                [{"workspaceId": "ws_abc", "refreshToken": "ls-refresh-token"}]
+                [
+                    {
+                        "workspaceId": "ws_abc",
+                        "refreshToken": "ls-refresh-token",
+                        "refreshExpiresAt": now + 30 * 86_400,
+                    }
+                ]
             ),
         },
         env_path=env_path,
@@ -445,7 +514,8 @@ def test_import_web_auth_without_workspace_list_keeps_existing_bootstrap(
     env_path = tmp_path / ".env"
     from core.config import read_env_file, write_env_file
 
-    auth_jwt = _make_jwt({"exp": int(time.time()) + 86_400, "wid": "ws_abc"})
+    now = int(time.time())
+    auth_jwt = _make_jwt({"exp": now + 86_400, "wid": "ws_abc"})
     write_env_file(
         {
             "PLAUD_AUTHORIZATION": "bearer old",
@@ -453,6 +523,7 @@ def test_import_web_auth_without_workspace_list_keeps_existing_bootstrap(
             "PLAUD_X_PLD_USER": "old-user",
             "PLAUD_WORKSPACE_ID": "ws_abc",
             "PLAUD_WS_REFRESH_TOKEN": "existing-refresh",
+            "PLAUD_WS_REFRESH_EXPIRES_AT": str(now + 30 * 86_400),
         },
         env_path,
     )
@@ -490,6 +561,7 @@ def test_rejected_existing_refresh_yields_to_fresh_web_login_candidate(
             "PLAUD_X_DEVICE_ID": "old-dev",
             "PLAUD_WORKSPACE_ID": "ws_abc",
             "PLAUD_WS_REFRESH_TOKEN": "dead-keychain-token",
+            "PLAUD_WS_REFRESH_EXPIRES_AT": str(now + 30 * 86_400),
         },
         env_path,
     )
@@ -500,7 +572,13 @@ def test_rejected_existing_refresh_yields_to_fresh_web_login_candidate(
             "authorization": f"Bearer {recovered_jwt}",
             "x_device_id": "device-from-webkit",
             "workspace_list": json.dumps(
-                [{"workspaceId": "ws_abc", "refreshToken": "fresh-browser-token"}]
+                [
+                    {
+                        "workspaceId": "ws_abc",
+                        "refreshToken": "fresh-browser-token",
+                        "refreshExpiresAt": now + 30 * 86_400,
+                    }
+                ]
             ),
         },
         env_path=env_path,

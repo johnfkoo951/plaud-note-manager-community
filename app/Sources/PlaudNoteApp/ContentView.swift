@@ -1726,11 +1726,13 @@ private struct FileListView: View {
                             Menu("Move to folder") {
                                 FolderRadioMenuItems(store: store, fileID: file.id)
                             }
-                            Button("Send to Obsidian") {
-                                Task { await store.sendToObsidian(file.id) }
-                            }
-                            Button("Transcribe with ElevenLabs") {
-                                Task { await store.transcribeWithElevenLabs(file.id) }
+                            if !DistributionProfile.isCommunity {
+                                Button("Send to Obsidian") {
+                                    Task { await store.sendToObsidian(file.id) }
+                                }
+                                Button("Transcribe with ElevenLabs") {
+                                    Task { await store.transcribeWithElevenLabs(file.id) }
+                                }
                             }
                         }
                         .swipeActions(edge: .leading, allowsFullSwipe: true) {
@@ -2205,6 +2207,7 @@ private struct FileRow: View {
     /// orange when waiting on speaker confirmation, blue when vault-ready,
     /// green once the final note is in the vault.
     private var dualColor: Color? {
+        guard !DistributionProfile.isCommunity else { return nil }
         switch file.dualStatus {
         case nil: return nil
         case "relabel-pending": return .orange
@@ -3270,7 +3273,11 @@ private struct DetailView: View {
                         .font(.title3.weight(.semibold))
                         .foregroundStyle(.primary)
 
-                    Text("Pick a recording from the list to see details,\ntranscripts, and AI summaries.")
+                    Text(
+                        DistributionProfile.isCommunity
+                            ? "Pick a recording to see its transcript, Plaud summary, and local organization."
+                            : "Pick a recording from the list to see details,\ntranscripts, and AI summaries."
+                    )
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -3458,9 +3465,7 @@ private struct DetailView: View {
             // selection or the library changes (transcription / integration
             // finishing both land through `reload()` -> `loadContent`).
             DetailMetricStrip(file: file, stage: store.selectedStage)
-            if !DistributionProfile.isCommunity {
-                MetadataBar(store: store, file: file)
-            }
+            MetadataBar(store: store, file: file)
         }
         .padding(14)
         // Modern floating header: glass material with subtle brand tint (Liquid Glass 2026 style)
@@ -3665,7 +3670,12 @@ private struct MetadataBar: View {
         return store.noteMetadata
     }
 
-    private var tags: [NoteTagVM] { metadata?.tags ?? [] }
+    private var tags: [NoteTagVM] {
+        let all = metadata?.tags ?? []
+        return DistributionProfile.isCommunity
+            ? all.filter { $0.source == "manual" }
+            : all
+    }
     private var isGenerating: Bool { store.metadataGeneratingIDs.contains(file.id) }
     private var isWritingMeeting: Bool { store.meetingNoteGeneratingIDs.contains(file.id) }
     /// Provider + configured model id for meeting-note generation. Metadata
@@ -3695,7 +3705,8 @@ private struct MetadataBar: View {
             // is an interactive radio menu — picking a folder replaces the
             // single assignment, picking the current one (or Unfiled) clears.
             HStack(spacing: AppUI.spacingS) {
-                if let type = metadata?.noteType, !type.isEmpty {
+                if !DistributionProfile.isCommunity,
+                   let type = metadata?.noteType, !type.isEmpty {
                     Label(type, systemImage: "doc.text")
                         .font(AppUI.metaFont)
                         .foregroundStyle(.tertiary)
@@ -3704,8 +3715,9 @@ private struct MetadataBar: View {
                 Spacer(minLength: 0)
             }
 
-            // Locally-owned editable controls: usage status, tag input, AI
-            // action buttons.
+            // Locally-owned editable controls: usage status and manual tags.
+            // Private-edition AI/Obsidian actions remain in a separate gated
+            // branch below so Community never exposes them.
             HStack(spacing: AppUI.spacingS) {
                 if let usageOption {
                     statusLabel(usageOption)
@@ -3758,55 +3770,60 @@ private struct MetadataBar: View {
                 .disabled(newTag.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .help("Add local tag")
 
-                Button {
-                    // No explicit model: the CLI resolves the configured
-                    // classify model (Settings > Auto-classify).
-                    Task { await store.generateMetadata(file.id) }
-                } label: {
-                    if isGenerating {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "sparkles")
-                    }
-                }
-                .buttonStyle(.plain)
-                .disabled(isGenerating)
-                .help("Generate metadata and auto tags")
-
-                Button {
-                    let choice = aiModelChoice
-                    Task {
-                        await store.writeMeetingNote(
-                            file.id, model: choice.provider, modelID: choice.modelID
-                        )
-                    }
-                } label: {
-                    if isWritingMeeting {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "doc.badge.plus")
-                    }
-                }
-                .buttonStyle(.plain)
-                .disabled(isWritingMeeting)
-                .help("Write CMDS meeting note in Obsidian")
-
-                if let path = metadata?.finalNotePath, !path.isEmpty {
+                if !DistributionProfile.isCommunity {
                     Button {
-                        store.openPath(path)
+                        // No explicit model: the CLI resolves the configured
+                        // classify model (Settings > Auto-classify).
+                        Task { await store.generateMetadata(file.id) }
                     } label: {
-                        Image(systemName: "arrow.up.forward.app")
+                        if isGenerating {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "sparkles")
+                        }
                     }
                     .buttonStyle(.plain)
-                    .help("Open generated Obsidian note")
+                    .disabled(isGenerating)
+                    .help("Generate metadata and auto tags")
+
+                    Button {
+                        let choice = aiModelChoice
+                        Task {
+                            await store.writeMeetingNote(
+                                file.id, model: choice.provider, modelID: choice.modelID
+                            )
+                        }
+                    } label: {
+                        if isWritingMeeting {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "doc.badge.plus")
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isWritingMeeting)
+                    .help("Write CMDS meeting note in Obsidian")
+
+                    if let path = metadata?.finalNotePath, !path.isEmpty {
+                        Button {
+                            store.openPath(path)
+                        } label: {
+                            Image(systemName: "arrow.up.forward.app")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open generated Obsidian note")
+                    }
                 }
 
                 Spacer(minLength: 0)
             }
 
-            dualReuseRow
+            if !DistributionProfile.isCommunity {
+                dualReuseRow
+            }
 
-            if let description = metadata?.description, !description.isEmpty {
+            if !DistributionProfile.isCommunity,
+               let description = metadata?.description, !description.isEmpty {
                 Text(description)
                     .font(AppUI.metaFont)
                     .foregroundStyle(.tertiary)
@@ -3823,7 +3840,8 @@ private struct MetadataBar: View {
         .onChange(of: file.id) { _, _ in newTag = "" }
         .onChange(of: store.dualState?.status) { _, status in
             // Auto-open the confirmation sheet the moment names are ready.
-            if status == "relabel-pending", store.selectedID == file.id {
+            if !DistributionProfile.isCommunity,
+               status == "relabel-pending", store.selectedID == file.id {
                 showSpeakerSheet = true
             }
         }

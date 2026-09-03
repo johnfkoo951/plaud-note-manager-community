@@ -105,6 +105,28 @@
               <p class="eyebrow">RECORDING</p>
               <h2 id="detailTitle"></h2>
               <p id="detailMeta" class="muted"></p>
+              <section class="local-metadata" aria-labelledby="localMetadataTitle">
+                <div class="local-metadata-heading">
+                  <div>
+                    <h3 id="localMetadataTitle">내 로컬 정리</h3>
+                    <p>Plaud Cloud에는 보내지 않고 이 PC에만 저장합니다.</p>
+                  </div>
+                  <label for="usageStatus">사용 상태</label>
+                  <select id="usageStatus">
+                    <option value="unused">아직 안 씀</option>
+                    <option value="metadata-ready">메타데이터 준비</option>
+                    <option value="vault-linked">노트 연결됨</option>
+                    <option value="used-elsewhere">다른 곳에 활용</option>
+                    <option value="archived">보관</option>
+                  </select>
+                </div>
+                <div id="tagList" class="tag-list" aria-label="로컬 태그" aria-live="polite"></div>
+                <form id="tagForm" class="tag-editor">
+                  <label class="sr-only" for="tagInput">로컬 태그 추가</label>
+                  <input id="tagInput" maxlength="128" autocomplete="off" spellcheck="false" placeholder="태그 하나 입력">
+                  <button id="tagAddButton" type="submit" class="secondary">태그 추가</button>
+                </form>
+              </section>
               <div class="export-row">
                 <label for="exportKind">내보내기</label>
                 <select id="exportKind">

@@ -34,9 +34,32 @@ DEFAULTS = {
     "PLAUD_TIMEZONE": "Asia/Seoul",
 }
 
+# A normal browser "Copy as cURL" payload is only a few kilobytes. Keep this
+# aligned with the Windows loopback UI so an accidental clipboard dump cannot
+# make ``shlex.split`` consume unbounded memory or CPU.
+MAX_CURL_BYTES = 256 * 1024
+_CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _reject_control_characters(value: str) -> None:
+    """Reject C0/DEL in any value that may enter the credential store."""
+
+    if _CONTROL_CHARACTER_RE.search(value):
+        # Never reflect the offending header/cookie value: it may contain the
+        # very secret we are refusing to persist.
+        raise ValueError("copied cURL contains a control character in a credential value")
+
 
 def parse_curl(curl: str) -> dict[str, str]:
     """Return validated values from Chrome bash or Windows-cmd cURL."""
+
+    # Reject obviously oversized Python strings before allocating a second,
+    # potentially huge UTF-8 buffer. The encoded check enforces the actual
+    # cross-platform byte limit for non-ASCII clipboard contents.
+    if len(curl) > MAX_CURL_BYTES or len(curl.encode("utf-8")) > MAX_CURL_BYTES:
+        raise ValueError("copied cURL is unexpectedly large; copy one Plaud Network request")
+    if "\x00" in curl:
+        raise ValueError("copied cURL contains an invalid NUL character")
 
     out: dict[str, str] = dict(DEFAULTS)
     normalized = curl.replace("\\\r\n", " ").replace("\\\n", " ")
@@ -53,6 +76,7 @@ def parse_curl(curl: str) -> dict[str, str]:
     request_url: str | None = None
 
     def capture_header(raw: str) -> None:
+        _reject_control_characters(raw)
         if ":" not in raw:
             return
         key, _, val = raw.partition(":")
@@ -93,6 +117,7 @@ def parse_curl(curl: str) -> dict[str, str]:
             if token in ("-H", "--header"):
                 capture_header(value)
             elif token in ("-b", "--cookie"):
+                _reject_control_characters(value)
                 cookie = value.partition(":")[2] if value.lower().startswith("cookie:") else value
                 cookie = cookie.strip()
                 if cookie:
@@ -103,15 +128,33 @@ def parse_curl(curl: str) -> dict[str, str]:
             request_url = token
         index += 1
 
+    _reject_control_characters(request_url or "")
     parsed_url = urlsplit(request_url or "")
-    host = (parsed_url.hostname or "").lower()
-    if parsed_url.scheme != "https" or not (host.startswith("api") and host.endswith(".plaud.ai")):
+    try:
+        host = (parsed_url.hostname or "").lower()
+        port = parsed_url.port
+    except ValueError:
+        raise ValueError("cURL contains an invalid Plaud API URL") from None
+    is_plaud_api = host == "api.plaud.ai" or (
+        host.startswith("api-") and host.endswith(".plaud.ai")
+    )
+    if (
+        parsed_url.scheme != "https"
+        or not is_plaud_api
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or port not in (None, 443)
+    ):
         raise ValueError("cURL must target an https://api-*.plaud.ai request")
     out["PLAUD_BASE_URL"] = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
-    missing = [value for value in REQUIRED_HEADERS.values() if value not in out]
+    missing = [value for value in REQUIRED_HEADERS.values() if not out.get(value, "").strip()]
     if missing:
         raise ValueError(f"missing required headers in cURL: {', '.join(missing)}")
+    authorization = out["PLAUD_AUTHORIZATION"].strip()
+    scheme, separator, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not separator or not token.strip():
+        raise ValueError("authorization header must contain a non-empty Bearer token")
     return out
 
 

@@ -1,6 +1,7 @@
 import httpx
 import pytest
 
+import core.auth_status as auth_status_mod
 from core.client import PlaudAPIError, PlaudClient
 from core.config import PlaudConfig
 
@@ -55,3 +56,4 @@ def test_client_classifies_http_200_business_status_minus_419_as_auth_rejection(
 
     assert excinfo.value.api_status == -419
     assert excinfo.value.is_auth_rejection is True
+    assert auth_status_mod.auth_rejected_at() is not None

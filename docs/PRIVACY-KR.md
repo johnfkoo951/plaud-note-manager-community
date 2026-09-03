@@ -24,7 +24,7 @@ macOS는 전용 폴더를 0700 권한으로 만들고 Python 프로세스는 077
 
 기본 기능은 Plaud 서비스와 통신합니다.
 
-- `https://web.plaud.ai`: macOS 앱 내 로그인, 또는 Windows에서 사용자가 직접 cURL을 복사하는 웹 세션
+- `https://web.plaud.ai`: macOS 앱 내 로그인 또는 수동 cURL 폴백, Windows에서 사용자가 직접 cURL을 복사하는 웹 세션
 - `https://api*.plaud.ai`: 계정 지역의 API, 토큰 갱신, 목록·전사·요약·오디오 접근
 
 API 자격증명은 HTTPS Plaud API 하위 도메인에만 전송합니다. API 클라이언트는 리디렉션과 시스템 프록시 환경 변수를 따르지 않습니다. Community판은 외부 생성형 AI, ElevenLabs, Obsidian, 로컬 Chrome 프로필 또는 셸 설정을 자동으로 탐색하지 않습니다.
@@ -36,6 +36,7 @@ Windows 화면은 `127.0.0.1`의 임의 포트에만 바인딩합니다. 임의 
 - Sync: 제목과 목록 중심의 메타데이터를 로컬 DB에 저장합니다.
 - Backfill: 아직 없는 전사·요약을 로컬 DB에 내려받습니다.
 - Download/Export: 선택한 내용을 로컬 파일로 저장합니다. Windows Lite판은 전용 `exports` 폴더만 사용합니다.
+- 사용 상태·수동 태그: macOS와 Windows 모두 Community 전용 로컬 DB에만 저장하며 Plaud Cloud로 보내지 않습니다.
 - 폴더·제목 정리: macOS판에서만 제공하며 실행하면 본인의 Plaud Cloud 상태가 바뀔 수 있습니다. Windows Lite판은 Plaud Cloud 변경 기능을 제공하지 않습니다.
 
 ## 연결 해제와 삭제
@@ -47,6 +48,7 @@ Windows 화면은 `127.0.0.1`의 임의 포트에만 바인딩합니다. 임의 
 - 개발자의 개인 인증정보·DB·볼트·브라우저 프로필을 포함하거나 읽지 않음
 - 참가자의 Plaud 비밀번호를 앱 코드나 설정 파일에 기록하지 않음
 - 사용자 동의 없이 전체 전사·요약을 자동 Backfill하지 않음
+- AI로 녹음을 자동 분류하거나 폴더로 자동 이동하지 않음
 - 외부 AI 서비스에 전사·요약을 전송하지 않음
 
 비밀 스캔과 권한 검사는 방어 수단이지 비밀 부재의 수학적 증명은 아닙니다. 배포자는 최종 ZIP마다 제공된 감사 스크립트와 체크섬을 다시 생성해야 합니다.

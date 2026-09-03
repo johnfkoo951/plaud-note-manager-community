@@ -3,7 +3,10 @@ from __future__ import annotations
 import inspect
 import site
 import sys
+import tomllib
+from pathlib import Path
 
+from windows_app import __version__
 from windows_app import launcher
 
 
@@ -61,3 +64,11 @@ def test_launcher_configures_before_importing_self_test():
     assert source.index("configure_environment()") < source.index(
         "from .self_test import run_self_test"
     )
+
+
+def test_windows_package_version_matches_project_version():
+    project_file = Path(__file__).parents[2] / "pyproject.toml"
+    with project_file.open("rb") as handle:
+        project_version = tomllib.load(handle)["project"]["version"]
+
+    assert __version__ == project_version

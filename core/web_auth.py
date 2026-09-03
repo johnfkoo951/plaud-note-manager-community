@@ -189,7 +189,10 @@ def _default_live_validator(values: Mapping[str, str]) -> str:
     )
     try:
         # 10s timeout keeps the app's 40s watchdog comfortable.
-        with PlaudClient(cfg, timeout=10.0) as client:
+        # This is a probe of an uncommitted candidate, not the active stored
+        # credential generation. A rejection must not poison auth_state.json
+        # for credentials that remain untouched by validate-before-write.
+        with PlaudClient(cfg, timeout=10.0, record_auth_rejections=False) as client:
             client.list_files(limit=1)
     except PlaudAPIError as exc:
         # HTTP 401/403 and Plaud's HTTP-200 business status -419 are genuine

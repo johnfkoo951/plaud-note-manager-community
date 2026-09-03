@@ -847,10 +847,10 @@ def refresh_auth_cmd(
     validate_live: bool = typer.Option(
         False,
         "--validate-live",
-        help="Verify recording-list access before replacing Keychain credentials.",
+        help="Verify recording-list access before replacing protected credentials.",
     ),
 ) -> None:
-    """Refresh macOS Keychain from a fresh Plaud API cURL."""
+    """Refresh OS-protected credentials from a fresh Plaud API cURL."""
     from core.refresh_auth import refresh_auth
 
     curl_text = sys.stdin.read() if stdin else None
@@ -861,6 +861,8 @@ def refresh_auth_cmd(
                 "status": result.status,
                 "detail": result.detail,
                 "cookie_captured": result.cookie_captured,
+                "auto_refresh_armed": result.auto_refresh_armed,
+                "auto_refresh_detail": result.auto_refresh_detail,
             }
         )
         return
@@ -868,6 +870,13 @@ def refresh_auth_cmd(
         cookie = "yes" if result.cookie_captured else "no"
         console.print("[green]✅ credentials refreshed from copied cURL[/green]")
         console.print(f"  cookie captured: {cookie}")
+        if result.auto_refresh_armed:
+            console.print("  [green]automatic renewal: armed[/green]")
+        else:
+            console.print(
+                "  [yellow]automatic renewal: not armed[/yellow] — "
+                "the copied cURL stores current access only"
+            )
         from core.auth_status import auth_status as get_auth
 
         st = get_auth()

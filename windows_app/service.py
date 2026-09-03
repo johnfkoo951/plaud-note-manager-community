@@ -18,8 +18,21 @@ from pathlib import Path
 from typing import Any, Protocol
 
 _FILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z")
+_CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 _EXPORT_KINDS = frozenset({"transcript", "summary", "outline", "notes"})
 _MAX_CURL_BYTES = 256 * 1024
+_MAX_TAG_BYTES = 128
+
+# These values are deliberately shared with the macOS/CLI local metadata UI.
+# They are local organization state only; setting one never mutates Plaud Cloud.
+USAGE_STATUSES = (
+    "unused",
+    "metadata-ready",
+    "vault-linked",
+    "used-elsewhere",
+    "archived",
+)
+_USAGE_STATUS_SET = frozenset(USAGE_STATUSES)
 
 
 class PathsLike(Protocol):
@@ -169,13 +182,12 @@ class CommunityService:
     def recording(self, file_id: str) -> dict[str, Any]:
         file_id = _valid_file_id(file_id)
         storage = self._storage_factory()
-        row = storage.get_file_row(file_id)
-        if row is None or int(row["is_trash"] or 0) != 0:
-            raise ServiceError("not_found", "녹음을 찾을 수 없습니다.", status=404)
+        row = _active_file(storage, file_id)
         content = storage.get_content_row(file_id)
         payload = _file_row(row)
         payload["cached"] = content is not None
         payload["content"] = _content_row(content) if content is not None else None
+        payload["local_metadata"] = _local_metadata(storage, file_id)
         return payload
 
     def search(self, query: str, *, limit: int = 50) -> dict[str, Any]:
@@ -342,12 +354,11 @@ class CommunityService:
                 "cookie_captured": bool(result.cookie_captured),
             }
         if result.status == "live_check_unavailable":
-            return {
-                "status": "connected_unverified",
-                "verification": "unreachable",
-                "cookie_captured": bool(result.cookie_captured),
-                "message": "인증은 저장했지만 네트워크 문제로 확인하지 못했습니다.",
-            }
+            raise ServiceError(
+                "live_check_unavailable",
+                "Plaud 연결을 확인하지 못해 인증을 저장하지 않았습니다. 기존 연결 정보는 유지됩니다.",
+                status=503,
+            )
         if result.status == "live_auth_failed":
             raise ServiceError(
                 "live_auth_failed",
@@ -372,6 +383,40 @@ class CommunityService:
                 "disconnect_failed", "연결 정보를 삭제하지 못했습니다.", status=500
             ) from None
         return {"status": "disconnected"}
+
+    def set_usage_status(self, file_id: Any, usage_status: Any) -> dict[str, Any]:
+        """Set one of the five local workflow states without touching Plaud Cloud."""
+
+        file_id = _valid_file_id(file_id)
+        if not isinstance(usage_status, str) or usage_status not in _USAGE_STATUS_SET:
+            raise ServiceError(
+                "invalid_usage_status",
+                "사용 상태가 올바르지 않습니다.",
+            )
+        storage = self._storage_factory()
+        _active_file(storage, file_id)
+        storage.update_usage_status(file_id, usage_status, now=int(time.time()))
+        return _local_metadata(storage, file_id)
+
+    def add_tag(self, file_id: Any, raw_tag: Any) -> dict[str, Any]:
+        """Add one normalized manual tag to the local database only."""
+
+        file_id = _valid_file_id(file_id)
+        tag = _valid_tag(raw_tag)
+        storage = self._storage_factory()
+        _active_file(storage, file_id)
+        storage.add_note_tags(file_id, [tag], source="manual", now=int(time.time()))
+        return _local_metadata(storage, file_id)
+
+    def remove_tag(self, file_id: Any, raw_tag: Any) -> dict[str, Any]:
+        """Remove one normalized tag from the local database only."""
+
+        file_id = _valid_file_id(file_id)
+        tag = _valid_tag(raw_tag)
+        storage = self._storage_factory()
+        _active_file(storage, file_id)
+        storage.remove_note_tags(file_id, [tag])
+        return _local_metadata(storage, file_id)
 
     def export(self, file_id: str, kind: str) -> dict[str, str]:
         file_id = _valid_file_id(file_id)
@@ -399,10 +444,49 @@ def _bounded_int(value: Any, *, minimum: int, maximum: int, label: str) -> int:
 
 
 def _valid_file_id(value: Any) -> str:
-    value = str(value or "")
+    if not isinstance(value, str):
+        raise ServiceError("invalid_file_id", "녹음 식별자가 올바르지 않습니다.")
+    value = value.strip()
     if not _FILE_ID.fullmatch(value) or value in {".", ".."}:
         raise ServiceError("invalid_file_id", "녹음 식별자가 올바르지 않습니다.")
     return value
+
+
+def _active_file(storage: Any, file_id: str) -> Mapping[str, Any]:
+    row = storage.get_file_row(file_id)
+    if row is None or int(row["is_trash"] or 0) != 0:
+        raise ServiceError("not_found", "녹음을 찾을 수 없습니다.", status=404)
+    return row
+
+
+def _valid_tag(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ServiceError("invalid_tag", "태그를 확인하세요.")
+    raw = value.strip()
+    if not raw or _CONTROL_CHARACTER.search(raw) or len(raw.encode("utf-8")) > _MAX_TAG_BYTES:
+        raise ServiceError("invalid_tag", "태그를 확인하세요.")
+
+    # Import lazily so the Windows launcher can establish its isolated runtime
+    # before any shared core module is loaded.
+    from core.tags import normalize_tags
+
+    normalized = normalize_tags([raw])
+    if len(normalized) != 1 or len(normalized[0].encode("utf-8")) > _MAX_TAG_BYTES:
+        raise ServiceError("invalid_tag", "태그는 한 번에 하나씩 입력하세요.")
+    return normalized[0]
+
+
+def _local_metadata(storage: Any, file_id: str) -> dict[str, Any]:
+    metadata = storage.get_note_metadata(file_id)
+    raw_status = metadata["usage_status"] if metadata is not None else "unused"
+    usage_status = raw_status if raw_status in _USAGE_STATUS_SET else "unused"
+    tags = [str(row["tag"]) for row in storage.list_note_tags(file_id)]
+    return {
+        "usage_status": usage_status,
+        "usage_statuses": list(USAGE_STATUSES),
+        "tags": tags,
+        "storage": "local-only",
+    }
 
 
 def _file_row(row: Mapping[str, Any]) -> dict[str, Any]:

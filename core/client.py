@@ -65,14 +65,14 @@ def _safe_json(resp: httpx.Response, label: str) -> dict[str, Any]:
         raise PlaudAPIError(f"Plaud returned a non-JSON response for {label}") from None
 
 
-def _note_rejection(exc: PlaudAPIError) -> PlaudAPIError:
+def _note_rejection(exc: PlaudAPIError, *, record_auth_rejections: bool = True) -> PlaudAPIError:
     """Persist the server's auth verdict, then hand the error back unchanged.
 
     Offline JWT expiry math cannot see a server-side invalidation, so without
     this memo `auth_status` keeps reporting a dead token as "valid" and the
     self-heal / recovery paths never fire.
     """
-    if exc.is_auth_rejection:
+    if record_auth_rejections and exc.is_auth_rejection:
         from .auth_status import record_auth_rejection
 
         record_auth_rejection(status=exc.api_status or exc.status_code)
@@ -80,8 +80,18 @@ def _note_rejection(exc: PlaudAPIError) -> PlaudAPIError:
 
 
 class PlaudClient:
-    def __init__(self, config: PlaudConfig, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        config: PlaudConfig,
+        *,
+        timeout: float = 30.0,
+        record_auth_rejections: bool = True,
+    ) -> None:
         self._config = config
+        # Candidate credential probes must not mark the currently stored
+        # credential generation as rejected. Normal application clients keep
+        # the historical default and persist genuine server rejection memos.
+        self._record_auth_rejections = record_auth_rejections
         self._client = httpx.Client(
             base_url=config.base_url,
             headers=config.headers(),
@@ -115,7 +125,8 @@ class PlaudClient:
             label = _request_label(exc.request)
             status = exc.response.status_code
             raise _note_rejection(
-                PlaudAPIError(f"Plaud HTTP {status} for {label}", status_code=status)
+                PlaudAPIError(f"Plaud HTTP {status} for {label}", status_code=status),
+                record_auth_rejections=self._record_auth_rejections,
             ) from None
         except httpx.RequestError as exc:
             label = _request_label(exc.request)
@@ -151,7 +162,8 @@ class PlaudClient:
         if status not in (0, "0", None):
             msg = data.get("msg") or data.get("error") or "unknown Plaud error"
             raise _note_rejection(
-                PlaudAPIError(f"Plaud API error ({status}): {msg}", api_status=status)
+                PlaudAPIError(f"Plaud API error ({status}): {msg}", api_status=status),
+                record_auth_rejections=self._record_auth_rejections,
             )
         return data
 

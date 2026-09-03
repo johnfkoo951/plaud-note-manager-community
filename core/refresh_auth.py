@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .config import resolve_env_path
 from .curl_auth import parse_curl, store_credentials
-from .secret_store import CredentialStoreError
+from .secret_store import CredentialStoreError, load_credential_values
 
 
 @dataclass
@@ -32,6 +32,11 @@ class RefreshResult:
     status: str
     detail: str = ""
     cookie_captured: bool = False
+    # A copied API cURL carries the current access token, not Plaud's rotating
+    # workspace refresh token. This is true only when a same-workspace refresh
+    # unexpired token already existed and survived the atomic credential merge.
+    auto_refresh_armed: bool = False
+    auto_refresh_detail: str = ""
 
 
 def _read_pasteboard() -> str:
@@ -49,6 +54,16 @@ def _read_pasteboard() -> str:
 
 
 LiveValidator = Callable[[Mapping[str, str]], str]
+
+
+def _auto_refresh_is_armed(env_path: Path, *, candidate_authorization: str) -> bool:
+    from .ws_refresh import _refresh_binding_matches_candidate, _wid_from_authorization
+
+    return _refresh_binding_matches_candidate(
+        load_credential_values(env_path),
+        candidate_wid=_wid_from_authorization(candidate_authorization),
+        now=int(time.time()),
+    )
 
 
 def refresh_auth(
@@ -88,8 +103,6 @@ def refresh_auth(
     if _token_expired(values["PLAUD_AUTHORIZATION"], now=int(time.time())):
         return RefreshResult("live_auth_failed", "captured token is already expired")
 
-    status = "ok"
-    detail = "credentials refreshed from copied cURL"
     if validate_live:
         verdict = (live_validator or _default_live_validator)(values)
         if verdict == "rejected":
@@ -99,15 +112,46 @@ def refresh_auth(
                 cookie_captured="PLAUD_COOKIE" in values,
             )
         if verdict == "unreachable":
-            status = "live_check_unavailable"
-            detail = "credentials saved but could not be verified — check your network connection"
+            # The app presents this path as validate-before-write. A network
+            # outage is not proof that the candidate is usable, so preserve the
+            # complete previous credential generation and let the user retry.
+            return RefreshResult(
+                "live_check_unavailable",
+                "could not verify copied credentials; saved credentials unchanged — "
+                "check your network connection",
+                cookie_captured="PLAUD_COOKIE" in values,
+            )
 
     try:
         store_credentials(values, env_path)
     except (OSError, CredentialStoreError) as exc:
         return RefreshResult("write_failed", f"could not update credentials: {exc}")
+
+    try:
+        auto_refresh_armed = _auto_refresh_is_armed(
+            env_path,
+            candidate_authorization=values["PLAUD_AUTHORIZATION"],
+        )
+    except (OSError, CredentialStoreError) as exc:
+        return RefreshResult(
+            "write_failed",
+            f"credentials were written but renewal state could not be read: {exc}",
+            cookie_captured="PLAUD_COOKIE" in values,
+        )
+
+    if auto_refresh_armed:
+        detail = "credentials refreshed from copied cURL — automatic renewal remains armed"
+        auto_refresh_detail = "existing unexpired same-workspace renewal information was preserved"
+    else:
+        detail = "credentials refreshed from copied cURL — current access only"
+        auto_refresh_detail = (
+            "no unexpired same-workspace renewal information is stored; a copied cURL "
+            "does not contain Plaud's rotating workspace refresh token"
+        )
     return RefreshResult(
-        status,
+        "ok",
         detail,
         cookie_captured="PLAUD_COOKIE" in values,
+        auto_refresh_armed=auto_refresh_armed,
+        auto_refresh_detail=auto_refresh_detail,
     )

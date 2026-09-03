@@ -168,6 +168,11 @@ final class FileStore: ObservableObject {
     /// replaces the Keychain credential bundle. Drives auth UI spinners and disabled
     /// state.
     @Published var refreshingAuth = false
+    /// Outcome metadata for the most recent manual cURL import. A valid access
+    /// token and durable automatic renewal are separate facts; the auth sheet
+    /// uses these fields to avoid describing cURL-only setup as permanent.
+    @Published private(set) var lastCurlImportAutoRefreshArmed: Bool?
+    @Published private(set) var lastCurlImportDetail: String?
     /// Password-free fallback through the app's persistent Plaud Web session.
     @Published var authRecoveryPhase: AuthRecoveryPhase = .idle
     @Published var authRecoveryRequestID: Int = 0
@@ -710,6 +715,15 @@ final class FileStore: ObservableObject {
     private struct RefreshAuthResult: Decodable {
         let status: String
         let detail: String?
+        let autoRefreshArmed: Bool?
+        let autoRefreshDetail: String?
+
+        enum CodingKeys: String, CodingKey {
+            case status
+            case detail
+            case autoRefreshArmed = "auto_refresh_armed"
+            case autoRefreshDetail = "auto_refresh_detail"
+        }
     }
 
     /// Refresh Plaud credentials from a Plaud API cURL. When `curlText` is nil,
@@ -725,6 +739,8 @@ final class FileStore: ObservableObject {
     func refreshAuthCredentials(curlText: String? = nil) async -> Bool {
         guard !refreshingAuth else { return false }
         refreshingAuth = true
+        lastCurlImportAutoRefreshArmed = nil
+        lastCurlImportDetail = nil
         defer { refreshingAuth = false }
 
         let cleanCurl = curlText?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -756,6 +772,10 @@ final class FileStore: ObservableObject {
 
         let detail = result.detail?.trimmingCharacters(in: .whitespacesAndNewlines)
         let detailOrNil = (detail?.isEmpty ?? true) ? nil : detail
+        lastCurlImportAutoRefreshArmed = result.autoRefreshArmed
+        let refreshDetail = result.autoRefreshDetail?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        lastCurlImportDetail = (refreshDetail?.isEmpty == false) ? refreshDetail : nil
 
         switch result.status {
         case "ok":
@@ -765,11 +785,11 @@ final class FileStore: ObservableObject {
             await sync(showError: false)
             return true
         case "live_check_unavailable":
-            // The capture was saved, but an outage is not proof of a working
-            // connection. Keep the sheet open and let the user retry.
+            // Validate-before-write keeps the previous Keychain generation
+            // intact when the network cannot prove the pasted candidate.
             await refreshAuth(live: false)
             lastCommandError = detailOrNil
-                ?? "자격증명은 저장했지만 Plaud 연결을 검증하지 못했습니다. 네트워크를 확인해주세요."
+                ?? "Plaud 연결을 검증하지 못해 새 자격증명을 저장하지 않았습니다. 네트워크를 확인해주세요."
             return false
         case "live_auth_failed":
             // Validate-before-write leaves the previous Keychain item unchanged.
@@ -943,14 +963,14 @@ final class FileStore: ObservableObject {
     func addTag(_ rawTag: String, to fileID: String) async {
         let tag = rawTag.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !tag.isEmpty else { return }
-        await runPlaud(args: ["tag-add", fileID, tag])
+        await runPlaud(args: PlaudCommandArguments.tagAdd(fileID: fileID, tag: tag))
         noteMetadata = Database.shared.noteMetadata(for: fileID)
         // Refresh the sidebar tag counts + the file's chip set.
         reload()
     }
 
     func removeTag(_ tag: String, from fileID: String) async {
-        await runPlaud(args: ["tag-remove", fileID, tag])
+        await runPlaud(args: PlaudCommandArguments.tagRemove(fileID: fileID, tag: tag))
         noteMetadata = Database.shared.noteMetadata(for: fileID)
         reload()
     }

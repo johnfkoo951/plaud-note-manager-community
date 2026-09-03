@@ -219,14 +219,21 @@ def test_select_workspace_entry_rules() -> None:
 
 def test_capture_preserves_ws_keys_and_clears_stale_cookie(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    _seed_env(env, auth_exp=NOW - 10, extra={"PLAUD_COOKIE": "old-cookie"})
+    _seed_env(
+        env,
+        auth_exp=NOW - 10,
+        extra={
+            "PLAUD_COOKIE": "old-cookie",
+            "PLAUD_WS_REFRESH_EXPIRES_AT": str(NOW + 30 * 86_400),
+        },
+    )
     captured = {
         "PLAUD_AUTHORIZATION": "bearer " + _make_jwt({"exp": NOW + 86_400, "wid": "ws_abc"}),
         "PLAUD_X_DEVICE_ID": "dev-2",
         "PLAUD_X_PLD_USER": "user-2",
         "PLAUD_BASE_URL": "https://api-apne1.plaud.ai",
     }
-    update_env_file(credential_env_updates(captured, env), env)
+    update_env_file(credential_env_updates(captured, env, now=NOW), env)
     values = read_env_file(env)
     assert values["PLAUD_WS_REFRESH_TOKEN"] == "refresh-1"  # headless refresh survives
     assert "PLAUD_COOKIE" not in values  # stale cookie does not outlive the login
@@ -235,16 +242,54 @@ def test_capture_preserves_ws_keys_and_clears_stale_cookie(tmp_path: Path) -> No
 
 def test_capture_drops_ws_keys_when_workspace_changes(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    _seed_env(env, auth_exp=NOW - 10)
+    _seed_env(
+        env,
+        auth_exp=NOW - 10,
+        extra={"PLAUD_WS_REFRESH_EXPIRES_AT": str(NOW + 30 * 86_400)},
+    )
     captured = {
         "PLAUD_AUTHORIZATION": "bearer " + _make_jwt({"exp": NOW + 86_400, "wid": "ws_OTHER"}),
         "PLAUD_X_DEVICE_ID": "dev-2",
         "PLAUD_X_PLD_USER": "user-2",
     }
-    update_env_file(credential_env_updates(captured, env), env)
+    update_env_file(credential_env_updates(captured, env, now=NOW), env)
     values = read_env_file(env)
     assert "PLAUD_WS_REFRESH_TOKEN" not in values
     assert "PLAUD_WORKSPACE_ID" not in values
+
+
+@pytest.mark.parametrize(
+    "binding_case",
+    ["opaque_candidate", "expired_refresh", "missing_horizon", "missing_workspace_id"],
+)
+def test_capture_drops_refresh_binding_that_cannot_be_proven_safe(
+    binding_case: str, tmp_path: Path
+) -> None:
+    env = tmp_path / ".env"
+    expiry: int | None = NOW + 30 * 86_400
+    candidate_authorization = "bearer " + _make_jwt({"exp": NOW + 86_400, "wid": "ws_abc"})
+    if binding_case == "opaque_candidate":
+        candidate_authorization = "bearer opaque.token.value"
+    elif binding_case == "expired_refresh":
+        expiry = NOW - 1
+    elif binding_case == "missing_horizon":
+        expiry = None
+
+    extra = {"PLAUD_WS_REFRESH_EXPIRES_AT": str(expiry)} if expiry is not None else None
+    _seed_env(env, auth_exp=NOW - 10, extra=extra)
+    if binding_case == "missing_workspace_id":
+        update_env_file({"PLAUD_WORKSPACE_ID": None}, env)
+    captured = {
+        "PLAUD_AUTHORIZATION": candidate_authorization,
+        "PLAUD_X_DEVICE_ID": "dev-2",
+    }
+
+    update_env_file(credential_env_updates(captured, env, now=NOW), env)
+
+    values = read_env_file(env)
+    assert "PLAUD_WORKSPACE_ID" not in values
+    assert "PLAUD_WS_REFRESH_TOKEN" not in values
+    assert "PLAUD_WS_REFRESH_EXPIRES_AT" not in values
 
 
 def test_capture_arms_from_workspace_list(tmp_path: Path) -> None:
@@ -256,18 +301,55 @@ def test_capture_arms_from_workspace_list(tmp_path: Path) -> None:
         "PLAUD_X_PLD_USER": "user-2",
     }
     ws_list = json.dumps(
-        [{"workspaceId": "ws_abc", "refreshToken": "fresh-tok", "domain": "api-eu1.plaud.ai"}]
+        [
+            {
+                "workspaceId": "ws_abc",
+                "refreshToken": "fresh-tok",
+                "refreshExpiresAt": NOW + 30 * 86_400,
+                "domain": "api-eu1.plaud.ai",
+            }
+        ]
     )
-    updates = credential_env_updates(captured, env, workspace_list_json=ws_list)
+    updates = credential_env_updates(captured, env, workspace_list_json=ws_list, now=NOW)
     update_env_file(updates, env)
     values = read_env_file(env)
     assert values["PLAUD_WS_REFRESH_TOKEN"] == "fresh-tok"
     assert values["PLAUD_BASE_URL"] == "https://api-eu1.plaud.ai"
     # malformed export is not fatal
     assert (
-        credential_env_updates(captured, env, workspace_list_json="oops")["PLAUD_X_DEVICE_ID"]
+        credential_env_updates(captured, env, workspace_list_json="oops", now=NOW)[
+            "PLAUD_X_DEVICE_ID"
+        ]
         == "dev-2"
     )
+
+
+def test_capture_does_not_arm_expired_workspace_list_entry(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    _seed_env(env, auth_exp=NOW - 10, ws_token=None)
+    captured = {
+        "PLAUD_AUTHORIZATION": "bearer " + _make_jwt({"exp": NOW + 86_400, "wid": "ws_abc"}),
+        "PLAUD_X_DEVICE_ID": "dev-2",
+    }
+    ws_list = json.dumps(
+        [
+            {
+                "workspaceId": "ws_abc",
+                "refreshToken": "expired-browser-token",
+                "refreshExpiresAt": NOW - 1,
+            }
+        ]
+    )
+
+    update_env_file(
+        credential_env_updates(captured, env, workspace_list_json=ws_list, now=NOW),
+        env,
+    )
+
+    values = read_env_file(env)
+    assert "PLAUD_WORKSPACE_ID" not in values
+    assert "PLAUD_WS_REFRESH_TOKEN" not in values
+    assert "PLAUD_WS_REFRESH_EXPIRES_AT" not in values
 
 
 # ------------------------------------------------ refresh_workspace_token

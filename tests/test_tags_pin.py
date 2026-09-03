@@ -3,7 +3,10 @@
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
+import cli.main as cli_mod
+from cli.main import app
 from core import app_config
 from core.models import PlaudFile
 from core.storage import Storage
@@ -44,3 +47,20 @@ def test_pinned_tags_roundtrip_and_toggle(tmp_path: Path, monkeypatch: pytest.Mo
     assert app_config.pinned_tags() == []
     app_config.set_pinned_tags(["a", "a", "b"])  # de-dupes, preserves order
     assert app_config.pinned_tags() == ["a", "b"]
+
+
+def test_tag_commands_accept_dash_prefixed_positionals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = Storage(db_path=tmp_path / "tags.db")
+    storage.upsert_file(PlaudFile(id="a", filename="A"), now=1)
+    monkeypatch.setattr(cli_mod, "Storage", lambda: storage)
+    runner = CliRunner()
+
+    added = runner.invoke(app, ["tag-add", "a", "--", "--topic"])
+    assert added.exit_code == 0
+    assert [row["tag"] for row in storage.list_note_tags("a")] == ["topic"]
+
+    removed = runner.invoke(app, ["tag-remove", "a", "--", "-topic"])
+    assert removed.exit_code == 0
+    assert storage.list_note_tags("a") == []

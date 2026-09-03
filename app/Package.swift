@@ -15,6 +15,11 @@ let package = Package(
             name: "PlaudNoteApp",
             dependencies: [.product(name: "GRDB", package: "GRDB.swift")],
             path: "Sources/PlaudNoteApp"
+        ),
+        .testTarget(
+            name: "PlaudNoteAppTests",
+            dependencies: ["PlaudNoteApp"],
+            path: "Tests/PlaudNoteAppTests"
         )
     ]
 )

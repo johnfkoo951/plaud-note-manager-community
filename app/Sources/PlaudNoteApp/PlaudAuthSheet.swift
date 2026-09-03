@@ -9,12 +9,17 @@ struct PlaudAuthSheet: View {
     @State private var authenticating = false
     @State private var clipboardWatching = false
     @State private var showAdvancedCurl = false
-    @State private var showEmbeddedLogin = true
+    @State private var showEmbeddedLogin = false
     @State private var webStatus = "Sign in once; automatic renewal will be verified and saved."
     @State private var clearingSession = false
     /// Failure surfaced inline in the sheet. The root ContentView alert is
     /// queued behind this sheet on macOS, so errors must be shown here.
     @State private var importError: String?
+    /// A copied cURL can prove and store current access without carrying the
+    /// rotating workspace refresh token. Keep that partial success visible so
+    /// Community never implies that durable renewal was configured.
+    @State private var importNotice: String?
+    @State private var accessCredentialSaved = false
     /// Bumped after every failed capture or session clear so the embedded
     /// web view resets its one-shot capture latch and reloads.
     @State private var captureGeneration = 0
@@ -25,21 +30,23 @@ struct PlaudAuthSheet: View {
         curlText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var curlValidation: PlaudCurlValidation {
+        PlaudCurlValidator.inspect(trimmedCurl)
+    }
+
     private var isBusy: Bool {
-        authenticating || store.refreshingAuth
+        authenticating || store.refreshingAuth || recovering || store.refreshingWorkspaceToken
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: AppUI.spacingL) {
             header
+            browserImportCard
+            advancedCurl
             if !DistributionProfile.isCommunity {
                 autoRecoverCard
             }
             embeddedLoginFallback
-            if !DistributionProfile.isCommunity {
-                browserImportCard
-                advancedCurl
-            }
             footer
         }
         .padding(22)
@@ -62,7 +69,7 @@ struct PlaudAuthSheet: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Authenticate with Plaud")
                     .font(.title3.weight(.semibold))
-                Text("Sign in once here. Workspace credentials stay in macOS Keychain, while the persistent Plaud account session can silently replace a revoked rotation. You only sign in again when that account session expires.")
+                Text("A verified cURL stores current access in macOS Keychain. It preserves durable automatic renewal only when matching renewal information already exists; the optional Web Login below can set that up.")
                     .font(AppUI.metaFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -149,6 +156,23 @@ struct PlaudAuthSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if let importNotice {
+                Label(importNotice, systemImage: "checkmark.shield.fill")
+                    .font(AppUI.metaFont)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if authenticating {
+                Label(
+                    "Checking the copied credentials with Plaud before saving to Keychain…",
+                    systemImage: "checkmark.shield"
+                )
+                .font(AppUI.metaFont)
+                .foregroundStyle(AppUI.accentPink)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
             Text("A URL alone is not enough. In DevTools > Network, find any authenticated `api-*.plaud.ai` request (for example `weekly_recommend` or `file/simple/web`), right-click it, then Copy > Copy as cURL. The copied text must include authorization and x-device-id headers.")
                 .font(AppUI.metaFont)
                 .foregroundStyle(.secondary)
@@ -196,7 +220,7 @@ struct PlaudAuthSheet: View {
 
     private var embeddedLoginFallback: some View {
         DisclosureGroup(
-            "Plaud Web Login — recommended one-time setup",
+            "Plaud Web Login — optional renewal setup",
             isExpanded: $showEmbeddedLogin
         ) {
             VStack(alignment: .leading, spacing: AppUI.spacingS) {
@@ -223,11 +247,7 @@ struct PlaudAuthSheet: View {
                     .disabled(clearingSession || isBusy)
                 }
 
-                Text(
-                    DistributionProfile.isCommunity
-                        ? "If Google shows a Bluetooth or passkey error here, choose another sign-in method inside Plaud."
-                        : "If Google shows a Bluetooth or passkey error here, use Try another way or the browser import above."
-                )
+                Text("If Google shows a Bluetooth or passkey error here, use Try another way or the browser import above.")
                     .font(AppUI.metaFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -277,7 +297,7 @@ struct PlaudAuthSheet: View {
                         }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(trimmedCurl.isEmpty || isBusy)
+                    .disabled(!curlValidation.canImport || isBusy)
                 }
 
                 TextEditor(text: $curlText)
@@ -289,6 +309,18 @@ struct PlaudAuthSheet: View {
                         RoundedRectangle(cornerRadius: AppUI.radius)
                             .stroke(AppUI.cardStroke)
                     )
+
+                if !trimmedCurl.isEmpty {
+                    Label(
+                        curlValidation.message,
+                        systemImage: curlValidation.canImport
+                            ? "checkmark.circle.fill"
+                            : "exclamationmark.circle.fill"
+                    )
+                    .font(AppUI.metaFont)
+                    .foregroundStyle(curlValidation.canImport ? AppUI.brandGreen : .red)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(.top, AppUI.spacingS)
         }
@@ -300,7 +332,7 @@ struct PlaudAuthSheet: View {
                 .font(AppUI.metaFont)
                 .foregroundStyle(.secondary)
             Spacer()
-            Button("Cancel") { onDone() }
+            Button(accessCredentialSaved ? "Done" : "Cancel") { onDone() }
                 .keyboardShortcut(.cancelAction)
         }
     }
@@ -313,15 +345,15 @@ struct PlaudAuthSheet: View {
 
     private func importClipboardCurl() {
         importError = nil
+        importNotice = nil
+        accessCredentialSaved = false
         let text = NSPasteboard.general.string(forType: .string) ?? ""
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            importError = "클립보드에 Plaud cURL 텍스트가 없습니다."
-            return
-        }
-        guard looksLikePlaudCurl(trimmed) else {
+        let validation = PlaudCurlValidator.inspect(trimmed)
+        guard validation.canImport else {
             curlText = trimmed
-            importError = "URL만으로는 부족합니다. DevTools > Network에서 Plaud 요청을 우클릭한 뒤 Copy > Copy as cURL로 복사해 주세요."
+            showAdvancedCurl = true
+            importError = validation.message
             return
         }
         curlText = trimmed
@@ -330,6 +362,8 @@ struct PlaudAuthSheet: View {
 
     private func pasteClipboardIntoEditor() {
         importError = nil
+        importNotice = nil
+        accessCredentialSaved = false
         let text = NSPasteboard.general.string(forType: .string) ?? ""
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             importError = "클립보드에 Plaud cURL 텍스트가 없습니다."
@@ -346,7 +380,7 @@ struct PlaudAuthSheet: View {
                 lastChangeCount = NSPasteboard.general.changeCount
                 let text = NSPasteboard.general.string(forType: .string) ?? ""
                 let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if looksLikePlaudCurl(trimmed) {
+                if PlaudCurlValidator.inspect(trimmed).canImport {
                     curlText = trimmed
                     webStatus = "Plaud cURL found on clipboard. Importing..."
                     authenticateWithCurl(trimmed)
@@ -355,17 +389,6 @@ struct PlaudAuthSheet: View {
             }
             try? await Task.sleep(nanoseconds: 800_000_000)
         }
-    }
-
-    private func looksLikePlaudCurl(_ text: String) -> Bool {
-        let lowercased = text.lowercased()
-        return lowercased.contains("curl")
-            && lowercased.contains("plaud")
-            && (
-                lowercased.contains("authorization")
-                    || lowercased.contains("x-pld-user")
-                    || lowercased.contains("x-device-id")
-            )
     }
 
     private func authenticateWithWebCapture(_ capture: PlaudWebAuthCapture) {
@@ -385,11 +408,7 @@ struct PlaudAuthSheet: View {
                     onDone()
                 } else {
                     let message = store.lastCommandError
-                        ?? (
-                            DistributionProfile.isCommunity
-                                ? "Capture received, but Plaud rejected it. Clear the Web Session and sign in again."
-                                : "Capture received, but Plaud rejected it. Try browser import."
-                        )
+                        ?? "Capture received, but Plaud rejected it. Try browser import."
                     store.lastCommandError = nil
                     importError = message
                     webStatus = message
@@ -401,9 +420,16 @@ struct PlaudAuthSheet: View {
 
     private func authenticateWithCurl(_ curlOverride: String? = nil) {
         let curl = (curlOverride ?? trimmedCurl).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !curl.isEmpty, !isBusy else { return }
+        let validation = PlaudCurlValidator.inspect(curl)
+        guard validation.canImport, !isBusy else {
+            importError = validation.message
+            showAdvancedCurl = true
+            return
+        }
         clipboardWatching = false
         importError = nil
+        importNotice = nil
+        accessCredentialSaved = false
         authenticating = true
         Task {
             let ok = await store.refreshAuthCredentials(curlText: curl)
@@ -411,7 +437,15 @@ struct PlaudAuthSheet: View {
                 authenticating = false
                 if ok {
                     curlText = ""
-                    onDone()
+                    if store.lastCurlImportAutoRefreshArmed == true {
+                        onDone()
+                    } else {
+                        accessCredentialSaved = true
+                        let detailSuffix = store.lastCurlImportDetail.map { " (" + $0 + ")" } ?? ""
+                        importNotice = "Plaud accepted the cURL and current access is stored in Keychain. Durable automatic renewal is not armed"
+                            + detailSuffix
+                            + ". You can click Done now, or use Web Login below to set up renewal information."
+                    }
                 } else {
                     let message = store.lastCommandError
                         ?? "인증 갱신에 실패했습니다. Plaud cURL을 다시 복사해 주세요."

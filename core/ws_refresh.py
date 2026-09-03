@@ -230,6 +230,28 @@ def select_workspace_entry(
     return entries[0] if len(entries) == 1 else None
 
 
+_WORKSPACE_REFRESH_FIELDS = (
+    "PLAUD_WORKSPACE_ID",
+    "PLAUD_WS_REFRESH_TOKEN",
+    "PLAUD_WS_REFRESH_EXPIRES_AT",
+)
+
+
+def _refresh_binding_matches_candidate(
+    stored: Mapping[str, str], *, candidate_wid: str | None, now: int
+) -> bool:
+    """Whether a stored refresh chain is provably safe for this access token."""
+
+    refresh_expires_at = _normalize_epoch_seconds(stored.get("PLAUD_WS_REFRESH_EXPIRES_AT"))
+    return bool(
+        candidate_wid
+        and stored.get("PLAUD_WS_REFRESH_TOKEN")
+        and stored.get("PLAUD_WORKSPACE_ID") == candidate_wid
+        and refresh_expires_at is not None
+        and refresh_expires_at > now
+    )
+
+
 def credential_env_updates(
     captured: Mapping[str, str],
     env_path: Path,
@@ -237,48 +259,55 @@ def credential_env_updates(
     workspace_list_json: str | None = None,
     replace_workspace_refresh: bool = False,
     already_locked: bool = False,
+    now: int | None = None,
 ) -> dict[str, str | None]:
     """Turn a full credential capture into a merge-safe credential update.
 
     Capture-owned keys are set or explicitly cleared (a stale cookie must not
-    outlive the login that replaced it). The PLAUD_WS_* bootstrap keys are
-    preserved so a cURL re-import cannot disarm headless refresh — unless the
-    new token belongs to a *different* workspace (stale, cleared).  A captured
-    localStorage token normally does not replace an existing token for the same
-    workspace: the stored one may already have rotated beyond the browser's
-    stale copy. ``replace_workspace_refresh`` is reserved for a newer/recovered
-    WebKit generation whose access token was validated in memory.
+    outlive the login that replaced it). A stored refresh chain survives only
+    when the candidate access JWT has a decodable workspace id, that id exactly
+    matches the stored refresh workspace, and its stored expiry horizon is
+    known and still in the future. Unknown/mismatched/expired bindings are
+    cleared atomically with the access capture so a later auto-refresh cannot
+    switch the app back to another workspace.
+
+    A captured localStorage token normally does not replace a still-valid
+    stored token for the same workspace: the stored one may already have
+    rotated beyond the browser's stale copy. ``replace_workspace_refresh`` is
+    reserved for a newer/recovered WebKit generation whose access token was
+    validated in memory.
     """
+    now = int(time.time()) if now is None else now
     updates: dict[str, str | None] = {key: captured.get(key) or None for key in CAPTURE_OWNED_KEYS}
     new_wid = _wid_from_authorization(captured.get("PLAUD_AUTHORIZATION", ""))
     stored = load_credential_values(env_path, already_locked=already_locked)
-    stored_wid = stored.get("PLAUD_WORKSPACE_ID") or _wid_from_authorization(
-        stored.get("PLAUD_AUTHORIZATION", "")
+    preserve_stored_refresh = not replace_workspace_refresh and _refresh_binding_matches_candidate(
+        stored,
+        candidate_wid=new_wid,
+        now=now,
     )
-    stored_refresh = stored.get("PLAUD_WS_REFRESH_TOKEN")
 
     entry: WorkspaceBootstrap | None = None
-    if workspace_list_json:
+    if workspace_list_json and new_wid:
         try:
             entry = select_workspace_entry(parse_workspace_list(workspace_list_json), wid=new_wid)
         except ValueError:
             entry = None  # malformed export is not fatal — headless refresh just stays unarmed
+    entry_is_usable = bool(
+        entry is not None
+        and entry.workspace_id == new_wid
+        and entry.refresh_expires_at is not None
+        and entry.refresh_expires_at > now
+    )
 
-    if entry is not None and (
-        replace_workspace_refresh or not (stored_refresh and stored_wid == entry.workspace_id)
-    ):
+    if entry is not None and entry_is_usable and not preserve_stored_refresh:
         updates["PLAUD_WORKSPACE_ID"] = entry.workspace_id
         updates["PLAUD_WS_REFRESH_TOKEN"] = entry.refresh_token
-        updates["PLAUD_WS_REFRESH_EXPIRES_AT"] = (
-            str(entry.refresh_expires_at) if entry.refresh_expires_at else None
-        )
+        updates["PLAUD_WS_REFRESH_EXPIRES_AT"] = str(entry.refresh_expires_at)
         if entry.domain:
             updates["PLAUD_BASE_URL"] = _normalize_domain(entry.domain)
-    elif entry is None:
-        if stored_wid and new_wid and stored_wid != new_wid:
-            updates["PLAUD_WORKSPACE_ID"] = None
-            updates["PLAUD_WS_REFRESH_TOKEN"] = None
-            updates["PLAUD_WS_REFRESH_EXPIRES_AT"] = None
+    elif not preserve_stored_refresh:
+        updates.update(dict.fromkeys(_WORKSPACE_REFRESH_FIELDS))
     return updates
 
 

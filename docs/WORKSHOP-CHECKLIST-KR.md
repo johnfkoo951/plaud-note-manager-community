@@ -35,7 +35,7 @@
 
 - [ ] 체크섬 확인 후 설치
 - [ ] Community판 저장 위치와 외부 AI 비활성화 설명
-- [ ] macOS는 앱 내 Web Login, Windows는 로컬 화면의 cURL 가져오기
+- [ ] macOS는 앱 내 Web Login을 우선하고, 멈추면 인증 창의 cURL 폴백 사용. Windows는 로컬 화면의 cURL 가져오기
 - [ ] Sync로 목록만 먼저 확인
 
 ## 20:00–21:00 수집

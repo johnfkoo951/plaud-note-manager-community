@@ -5,7 +5,14 @@ const sessionToken = fragment.get("session") || "";
 window.history.replaceState(null, "", window.location.pathname);
 
 const $ = (id) => document.getElementById(id);
-const state = { selectedId: null, operation: "idle", sessionToken, pollTimer: null };
+const state = {
+  selectedId: null,
+  operation: "idle",
+  sessionToken,
+  pollTimer: null,
+  usageStatus: "unused",
+  tags: [],
+};
 
 function showMessage(text, danger = false) {
   const node = $("message");
@@ -111,6 +118,38 @@ function segmentNode(segment) {
   return node;
 }
 
+function renderLocalMetadata(metadata = {}) {
+  const allowed = new Set(Array.isArray(metadata.usage_statuses) ? metadata.usage_statuses : []);
+  const usageStatus = allowed.has(metadata.usage_status) ? metadata.usage_status : "unused";
+  state.usageStatus = usageStatus;
+  state.tags = Array.isArray(metadata.tags) ? metadata.tags.filter((tag) => typeof tag === "string") : [];
+  $("usageStatus").value = usageStatus;
+
+  const list = $("tagList");
+  list.replaceChildren();
+  if (!state.tags.length) {
+    const empty = document.createElement("span");
+    empty.className = "muted tag-empty";
+    empty.textContent = "아직 로컬 태그가 없습니다.";
+    list.append(empty);
+    return;
+  }
+  for (const tag of state.tags) {
+    const chip = document.createElement("span");
+    chip.className = "tag-chip";
+    const label = document.createElement("span");
+    label.textContent = `#${tag}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "tag-remove";
+    remove.textContent = "×";
+    remove.setAttribute("aria-label", `#${tag} 태그 제거`);
+    remove.addEventListener("click", () => removeTag(tag, remove));
+    chip.append(label, remove);
+    list.append(chip);
+  }
+}
+
 async function loadRecording(fileId) {
   try {
     const payload = await api(`/api/recording?id=${encodeURIComponent(fileId)}`);
@@ -119,6 +158,7 @@ async function loadRecording(fileId) {
     $("recordingDetail").hidden = false;
     $("detailTitle").textContent = payload.title || "제목 없는 녹음";
     $("detailMeta").textContent = `${formatDate(payload.edit_time || payload.start_time)} · ${formatDuration(payload.duration)}`;
+    renderLocalMetadata(payload.local_metadata);
     const content = payload.content;
     $("summaryText").textContent = content?.summary || (content ? "요약 없음" : "백필하지 않은 녹음입니다.");
     const transcript = $("transcriptText");
@@ -133,6 +173,22 @@ async function loadRecording(fileId) {
     }
     await loadLibrary();
   } catch (error) {
+    showMessage(error.message, true);
+  }
+}
+
+async function removeTag(tag, button) {
+  if (!state.selectedId) return;
+  button.disabled = true;
+  try {
+    const payload = await api("/api/tag-remove", {
+      method: "POST",
+      body: JSON.stringify({ file_id: state.selectedId, tag }),
+    });
+    renderLocalMetadata(payload);
+    showMessage("로컬 태그를 제거했습니다.");
+  } catch (error) {
+    button.disabled = false;
     showMessage(error.message, true);
   }
 }
@@ -178,6 +234,52 @@ $("clearSearchButton").addEventListener("click", () => {
 $("refreshButton").addEventListener("click", loadLibrary);
 $("syncButton").addEventListener("click", () => startJob("/api/sync"));
 $("backfillButton").addEventListener("click", () => startJob("/api/backfill", "아직 저장하지 않은 전사와 요약을 이 PC로 내려받습니다. 본인 PC에서 계속할까요?"));
+
+$("usageStatus").addEventListener("change", async () => {
+  if (!state.selectedId) return;
+  const previous = state.usageStatus;
+  $("usageStatus").disabled = true;
+  try {
+    const payload = await api("/api/usage-status", {
+      method: "POST",
+      body: JSON.stringify({
+        file_id: state.selectedId,
+        usage_status: $("usageStatus").value,
+      }),
+    });
+    renderLocalMetadata(payload);
+    showMessage("사용 상태를 이 PC에 저장했습니다.");
+  } catch (error) {
+    $("usageStatus").value = previous;
+    showMessage(error.message, true);
+  } finally {
+    $("usageStatus").disabled = false;
+  }
+});
+
+$("tagForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!state.selectedId) return;
+  const tag = $("tagInput").value.trim();
+  if (!tag) return showMessage("태그를 하나 입력하세요.", true);
+  $("tagInput").disabled = true;
+  $("tagAddButton").disabled = true;
+  try {
+    const payload = await api("/api/tag-add", {
+      method: "POST",
+      body: JSON.stringify({ file_id: state.selectedId, tag }),
+    });
+    $("tagInput").value = "";
+    renderLocalMetadata(payload);
+    showMessage("로컬 태그를 저장했습니다.");
+  } catch (error) {
+    showMessage(error.message, true);
+  } finally {
+    $("tagInput").disabled = false;
+    $("tagAddButton").disabled = false;
+    $("tagInput").focus();
+  }
+});
 
 $("importButton").addEventListener("click", async () => {
   const curl = $("curlInput").value;

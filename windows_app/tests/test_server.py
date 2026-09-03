@@ -52,6 +52,18 @@ class FakeService:
         self.calls.append(("export", file_id, kind))
         return {"status": "exported"}
 
+    def set_usage_status(self, file_id, usage_status):
+        self.calls.append(("usage-status", file_id, usage_status))
+        return {"usage_status": usage_status, "tags": [], "storage": "local-only"}
+
+    def add_tag(self, file_id, tag):
+        self.calls.append(("tag-add", file_id, tag))
+        return {"usage_status": "unused", "tags": [tag], "storage": "local-only"}
+
+    def remove_tag(self, file_id, tag):
+        self.calls.append(("tag-remove", file_id, tag))
+        return {"usage_status": "unused", "tags": [], "storage": "local-only"}
+
     def prepare_shutdown(self):
         self.calls.append("shutdown")
         return {"status": "shutting_down"}
@@ -132,6 +144,13 @@ def test_session_token_is_only_in_fragment(running_server):
         ("POST", "/api/import-curl", {"curl": "secret"}),
         ("POST", "/api/disconnect", {}),
         ("POST", "/api/export", {"file_id": "rec-1", "kind": "summary"}),
+        (
+            "POST",
+            "/api/usage-status",
+            {"file_id": "rec-1", "usage_status": "archived"},
+        ),
+        ("POST", "/api/tag-add", {"file_id": "rec-1", "tag": "회의"}),
+        ("POST", "/api/tag-remove", {"file_id": "rec-1", "tag": "회의"}),
         ("POST", "/api/shutdown", {}),
         ("HEAD", "/api/status", None),
         ("PUT", "/api/status", {}),
@@ -187,6 +206,27 @@ def test_valid_header_dispatches_and_response_is_hardened(running_server):
             {"file_id": "rec-1", "kind": "summary"},
             200,
             ("export", "rec-1", "summary"),
+        ),
+        (
+            "POST",
+            "/api/usage-status",
+            {"file_id": "rec-1", "usage_status": "archived"},
+            200,
+            ("usage-status", "rec-1", "archived"),
+        ),
+        (
+            "POST",
+            "/api/tag-add",
+            {"file_id": "rec-1", "tag": "회의"},
+            200,
+            ("tag-add", "rec-1", "회의"),
+        ),
+        (
+            "POST",
+            "/api/tag-remove",
+            {"file_id": "rec-1", "tag": "회의"},
+            200,
+            ("tag-remove", "rec-1", "회의"),
         ),
     ],
 )
@@ -249,6 +289,26 @@ def test_post_endpoints_accept_valid_session_without_logging_body(running_server
     assert service.calls == [("import", secret)]
     assert secret not in stderr.getvalue()
     assert stderr.getvalue() == ""
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/api/usage-status", {"file_id": "rec-1"}),
+        (
+            "/api/usage-status",
+            {"file_id": "rec-1", "usage_status": "archived", "cloud": True},
+        ),
+        ("/api/tag-add", {"file_id": "rec-1", "tag": "회의", "model": "auto"}),
+        ("/api/tag-remove", {"file_id": "rec-1"}),
+    ],
+)
+def test_local_write_routes_reject_missing_or_extra_fields(running_server, path, body):
+    server, service, token = running_server
+    status, _, payload = _request(server, "POST", path, token=token, body=body)
+    assert status == 400
+    assert json.loads(payload)["error"] == "invalid_fields"
+    assert service.calls == []
 
 
 def test_shutdown_endpoint_reserves_service_then_stops_server(running_server):
