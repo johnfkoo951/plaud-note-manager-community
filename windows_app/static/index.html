@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Plaud Note Manager Community Lite</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">WINDOWS COMMUNITY LITE</p>
+        <h1>수집한 기록을 다시 찾는 작은 서재</h1>
+        <p class="subcopy">Plaud의 목록·전사·요약을 내 PC에 보관하고 검색합니다.</p>
+      </div>
+      <button id="shutdownButton" class="quiet">앱 종료</button>
+    </header>
+
+    <div id="sessionWarning" class="notice danger" hidden>
+      안전한 앱 세션을 확인할 수 없습니다. 앱을 종료한 뒤 다시 실행하세요.
+    </div>
+    <div id="message" class="notice" role="status" aria-live="polite" hidden></div>
+
+    <section class="status-grid" aria-label="현재 상태">
+      <article class="status-card">
+        <span>연결</span>
+        <strong id="authState">확인 중</strong>
+      </article>
+      <article class="status-card">
+        <span>녹음</span>
+        <strong id="libraryTotal">0</strong>
+      </article>
+      <article class="status-card">
+        <span>내용 저장됨</span>
+        <strong id="cachedTotal">0</strong>
+      </article>
+      <article class="status-card operation-card">
+        <span>작업</span>
+        <strong id="operationState">대기 중</strong>
+        <small id="operationProgress"></small>
+      </article>
+    </section>
+
+    <main class="workspace">
+      <aside class="sidebar">
+        <section class="panel">
+          <h2>1. 연결</h2>
+          <p>본인 계정에서 복사한 Plaud API cURL만 입력하세요. 인증값은 Windows 전용 보안 저장소에 보관됩니다.</p>
+          <label for="curlInput">Plaud cURL</label>
+          <textarea id="curlInput" rows="5" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="curl ..."></textarea>
+          <div class="button-row">
+            <button id="importButton">안전하게 연결</button>
+            <button id="disconnectButton" class="secondary">연결 해제</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>2. 가져오기</h2>
+          <p><b>목록 동기화</b>는 제목과 날짜만 가져옵니다.</p>
+          <button id="syncButton" class="wide">목록 동기화</button>
+          <p><b>전사·요약 백필</b>은 아직 저장하지 않은 전체 내용을 이 PC로 내려받습니다. 공용 PC에서는 실행하지 마세요.</p>
+          <button id="backfillButton" class="wide accent">전사·요약 백필</button>
+        </section>
+
+        <section class="panel boundary">
+          <h2>이 제한판의 경계</h2>
+          <ul>
+            <li>Plaud Cloud는 읽기만 합니다.</li>
+            <li>웹 로그인과 오디오 재생은 없습니다.</li>
+            <li>외부 AI와 Obsidian을 연결하지 않습니다.</li>
+            <li>백필은 버튼을 눌렀을 때만 시작합니다.</li>
+          </ul>
+        </section>
+      </aside>
+
+      <section class="content">
+        <form id="searchForm" class="searchbar" role="search">
+          <label class="sr-only" for="searchInput">저장된 내용 검색</label>
+          <input id="searchInput" type="search" maxlength="200" placeholder="제목·전사·요약에서 검색">
+          <button type="submit">검색</button>
+          <button id="clearSearchButton" class="secondary" type="button">전체 보기</button>
+        </form>
+
+        <div class="content-grid">
+          <section class="panel list-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">LIBRARY</p>
+                <h2 id="listTitle">최근 녹음</h2>
+              </div>
+              <button id="refreshButton" class="quiet">새로고침</button>
+            </div>
+            <div id="recordingList" class="recording-list" aria-live="polite"></div>
+          </section>
+
+          <section class="panel detail-panel">
+            <div id="emptyDetail" class="empty-state">
+              <div class="empty-mark">⌕</div>
+              <h2>녹음을 선택하세요</h2>
+              <p>저장된 전사와 요약을 이 화면에서 확인할 수 있습니다.</p>
+            </div>
+            <article id="recordingDetail" hidden>
+              <p class="eyebrow">RECORDING</p>
+              <h2 id="detailTitle"></h2>
+              <p id="detailMeta" class="muted"></p>
+              <div class="export-row">
+                <label for="exportKind">내보내기</label>
+                <select id="exportKind">
+                  <option value="transcript">전사</option>
+                  <option value="summary">요약</option>
+                  <option value="outline">개요</option>
+                  <option value="notes">모든 노트</option>
+                </select>
+                <button id="exportButton">Markdown 저장</button>
+              </div>
+              <section class="detail-section">
+                <h3>요약</h3>
+                <pre id="summaryText"></pre>
+              </section>
+              <section class="detail-section">
+                <h3>전사</h3>
+                <div id="transcriptText" class="transcript"></div>
+              </section>
+            </article>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

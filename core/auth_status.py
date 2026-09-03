@@ -1,4 +1,4 @@
-"""Inspect macOS Keychain Plaud credentials for auth-status monitoring.
+"""Inspect OS-protected Plaud credentials for auth-status monitoring.
 
 The `authorization` header is a JWT (`bearer <header>.<payload>.<sig>`); its
 payload carries `iat` (issued) and `exp` (expires) plus workspace/member/role.
@@ -229,7 +229,7 @@ def auth_status(*, live: bool = False, now: int | None = None) -> AuthStatus:
 
 
 def _auto_refresh_state(now: int) -> tuple[str, int | None]:
-    """Classify automatic-renewal readiness from the Keychain credential blob."""
+    """Classify automatic-renewal readiness from the protected credential blob."""
     import os
 
     if os.environ.get("PLAUD_AUTO_REFRESH", "1") == "0":

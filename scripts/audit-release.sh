@@ -9,11 +9,20 @@ EXPECTED_IDENTIFIER="com.cmdspace.PlaudNoteManagerCommunity"
 EXPECTED_EXECUTABLE="PlaudNoteApp"
 EXPECTED_PROFILE="community"
 APP_PATH="${1:-$ROOT_DIR/dist/$APP_NAME.app}"
+EXPECTED_ARCH="${2:-${EXPECTED_ARCH:-arm64}}"
 
-if [[ $# -gt 1 ]]; then
-    echo "Usage: $0 [path-to-app]" >&2
+if [[ $# -gt 2 ]]; then
+    echo "Usage: $0 [path-to-app] [arm64|x86_64]" >&2
     exit 64
 fi
+
+case "$EXPECTED_ARCH" in
+    arm64|x86_64) ;;
+    *)
+        echo "Usage: $0 [path-to-app] [arm64|x86_64]" >&2
+        exit 64
+        ;;
+esac
 
 die() {
     printf '[FAIL] %s\n' "$1" >&2
@@ -42,7 +51,9 @@ PYTHON_HOME="$RESOURCES/python"
 INFO_PLIST="$CONTENTS/Info.plist"
 MAIN_EXECUTABLE="$CONTENTS/MacOS/$EXPECTED_EXECUTABLE"
 EMBEDDED_PYTHON="$PYTHON_HOME/bin/python3"
-SITE_PACKAGES="$PYTHON_HOME/lib/python3.12/site-packages"
+PYTHON_STDLIB="$(find "$PYTHON_HOME/lib" -mindepth 1 -maxdepth 1 -type d -name 'python3.*' -print | LC_ALL=C sort | tail -1)"
+[[ -n "$PYTHON_STDLIB" ]] || die "Embedded Python standard library is missing."
+SITE_PACKAGES="$PYTHON_STDLIB/site-packages"
 
 echo "Auditing macOS release: $APP_PATH"
 
@@ -100,7 +111,7 @@ assert_plist "CFBundleExecutable" "$EXPECTED_EXECUTABLE"
 assert_plist "CFBundlePackageType" "APPL"
 assert_plist "PlaudDistributionProfile" "$EXPECTED_PROFILE"
 assert_plist "LSMinimumSystemVersion" "14.0"
-assert_plist "LSArchitecturePriority:0" "arm64"
+assert_plist "LSArchitecturePriority:0" "$EXPECTED_ARCH"
 
 bundle_version="$(plist_value "CFBundleVersion")"
 short_version="$(plist_value "CFBundleShortVersionString")"
@@ -134,20 +145,15 @@ while IFS= read -r -d '' candidate; do
     if /usr/bin/file -b "$candidate" | /usr/bin/grep -q 'Mach-O'; then
         mach_o_count=$((mach_o_count + 1))
         architectures="$(/usr/bin/lipo -archs "$candidate" 2>/dev/null || true)"
-        case " $architectures " in
-            *" arm64 "*)
-                ;;
-            *)
-                die "Mach-O file does not contain arm64: ${candidate#"$APP_PATH"/} ($architectures)"
-                ;;
-        esac
+        [[ "$architectures" == "$EXPECTED_ARCH" ]] || \
+            die "Mach-O file is not exclusively $EXPECTED_ARCH: ${candidate#"$APP_PATH"/} ($architectures)"
         if ! /usr/bin/codesign --verify --strict "$candidate" >/dev/null 2>&1; then
             die "Nested Mach-O signature is invalid: ${candidate#"$APP_PATH"/}"
         fi
     fi
 done < <(find "$CONTENTS" -type f -print0)
 (( mach_o_count > 0 )) || die "No Mach-O executables were found in the bundle."
-pass "All $mach_o_count Mach-O files contain arm64 and have valid signatures."
+pass "All $mach_o_count Mach-O files are $EXPECTED_ARCH and have valid signatures."
 
 for forbidden_path in \
     "$RUNTIME/.env" \
@@ -304,4 +310,4 @@ if [[ "${REQUIRE_GATEKEEPER:-0}" == "1" ]]; then
     pass "Gatekeeper assessment passed."
 fi
 
-printf '\nRelease audit passed: %s (%s, %s signature)\n' "$short_version" "arm64" "$signature_kind"
+printf '\nRelease audit passed: %s (%s, %s signature)\n' "$short_version" "$EXPECTED_ARCH" "$signature_kind"

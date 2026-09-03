@@ -52,10 +52,19 @@ required_files=(
     "THIRD_PARTY_NOTICES.md"
     "pyproject.toml"
     "requirements-runtime.txt"
+    "requirements-windows.in"
+    "requirements-windows.txt"
     "core/distribution.py"
+    "core/curl_auth.py"
     "scripts/package-macos-app.sh"
+    "scripts/package-macos-intel.sh"
+    "scripts/package-windows-portable.py"
     "scripts/audit-release.sh"
+    "scripts/audit-windows-release.py"
     "scripts/install-local.sh"
+    "windows_app/launcher.py"
+    "windows_app/server.py"
+    "windows_app/service.py"
 )
 
 missing_files=""
@@ -162,6 +171,7 @@ rg_common=(
     --glob '!**/__pycache__/**'
     --glob '!scripts/audit-source.sh'
     --glob '!scripts/audit-release.sh'
+    --glob '!scripts/audit-windows-release.py'
 )
 
 # These are deliberately high-confidence token formats. Variable names and
@@ -182,7 +192,7 @@ plaud_literal_hits="$(
     cd "$SOURCE_ROOT" && \
     rg -l -e "$plaud_literal_pattern" \
         "${rg_common[@]}" \
-        --glob '!tests/**' \
+        --glob '!**/tests/**' \
         . 2>/dev/null || true
 )"
 if [[ -n "$plaud_literal_hits" ]]; then

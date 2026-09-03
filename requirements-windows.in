@@ -1,0 +1,4 @@
+# Direct dependencies for the Windows Community Lite portable runtime.
+httpx==0.28.1
+pydantic==2.13.3
+python-dotenv==1.2.2

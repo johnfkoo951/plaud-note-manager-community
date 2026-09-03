@@ -11,18 +11,23 @@
 - [ ] 깨끗한 Community 전용 Git 이력에서 빌드함
 - [ ] `scripts/audit-source.sh` 통과
 - [ ] Python 테스트·Ruff·Swift release build 통과
-- [ ] `scripts/package-macos-app.sh` 통과
+- [ ] `scripts/package-macos-app.sh`와 `scripts/package-macos-intel.sh` 통과
+- [ ] `python3 scripts/package-windows-portable.py` 정적 감사 통과
+- [ ] 실제 Windows 11 x64에서 packaged HTTP·DPAPI 자가진단 통과
 - [ ] 최종 앱에 `.env`, DB, 로그, 테스트 fixture, `.git`이 없음
 - [ ] 앱 바이너리/런타임에서 빌드 사용자 홈 경로와 개인 볼트명이 검출되지 않음
 - [ ] ZIP SHA-256 확인
 - [ ] 개인판과 Community판의 Bundle ID, Keychain, Application Support, WebKit 세션 분리 확인
-- [ ] Apple silicon/macOS 14 이상 및 미공증 제한을 참가자에게 사전 공지
+- [ ] arm64/x86_64/Windows x64 ZIP과 `SHA256SUMS`가 한 세트인지 확인
+- [ ] macOS 미공증·Windows 미서명 제한과 실기기 검증 상태를 참가자에게 사전 공지
 
 ## 참가자 사전 안내
 
-- [ ] 개인 Mac과 본인 Plaud 계정 준비
+- [ ] 개인 Mac 또는 Windows 11 x64 PC와 본인 Plaud 계정 준비
 - [ ] 민감한 녹음은 화면 공유 전에 숨기거나 별도 계정/자료 사용
 - [ ] 첫 실행 Control-클릭 → 열기 절차 안내
+- [ ] Windows 참가자에게 압축 전체 해제, cURL (cmd) 복사, 연결 후 클립보드 덮어쓰기 안내
+- [ ] SmartScreen·Smart App Control·백신을 전역으로 끄지 않도록 안내
 - [ ] Backfill이 전사·요약을 Mac에 저장한다는 점 안내
 - [ ] 수업 종료 후 연결 해제·Web Session·로컬 캐시 삭제 방법 제공
 
@@ -30,7 +35,7 @@
 
 - [ ] 체크섬 확인 후 설치
 - [ ] Community판 저장 위치와 외부 AI 비활성화 설명
-- [ ] 앱 내 Web Login
+- [ ] macOS는 앱 내 Web Login, Windows는 로컬 화면의 cURL 가져오기
 - [ ] Sync로 목록만 먼저 확인
 
 ## 20:00–21:00 수집

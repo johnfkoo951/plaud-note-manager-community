@@ -293,7 +293,11 @@ def _call_workspace_refresh(
     trusted_base_url = _normalize_domain(base_url)
     url = f"{trusted_base_url}/user-app/auth/workspace/refresh/{workspace_id}"
     resp = httpx.post(
-        url, json={}, headers={"Authorization": f"bearer {refresh_token}"}, timeout=timeout
+        url,
+        json={},
+        headers={"Authorization": f"bearer {refresh_token}"},
+        timeout=timeout,
+        trust_env=False,
     )
     resp.raise_for_status()
     body = resp.json()

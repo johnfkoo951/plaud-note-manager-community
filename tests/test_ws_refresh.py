@@ -274,9 +274,15 @@ def test_capture_arms_from_workspace_list(tmp_path: Path) -> None:
 
 
 def _fake_post(response_json: dict | None = None, *, status: int = 200, calls: list | None = None):
-    def post(url, json=None, headers=None, timeout=None):  # noqa: A002 - httpx kwarg
+    def post(  # noqa: A002 - httpx kwargs
+        url,
+        json=None,
+        headers=None,
+        timeout=None,
+        trust_env=True,
+    ):
         if calls is not None:
-            calls.append({"url": url, "headers": headers})
+            calls.append({"url": url, "headers": headers, "trust_env": trust_env})
         request = httpx.Request("POST", url)
         return httpx.Response(status, json=response_json or {}, request=request)
 
@@ -309,6 +315,7 @@ def test_refresh_ok_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert outcome.status == "ok"
     assert calls[0]["url"].endswith("/user-app/auth/workspace/refresh/ws_abc")
     assert calls[0]["headers"]["Authorization"] == "bearer refresh-1"
+    assert calls[0]["trust_env"] is False
     assert read_env_file(env)["PLAUD_WS_REFRESH_TOKEN"] == "refresh-2"
 
 

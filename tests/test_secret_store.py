@@ -196,3 +196,28 @@ def test_community_disconnect_refuses_another_keychain_namespace(
 
     assert fake_keychain.stored is not None
     assert read_env_file(settings_env) == {"PLAUD_AUTHORIZATION": "keep-placeholder"}
+
+
+def test_community_disconnect_accepts_windows_lite_namespace(
+    tmp_path: Path,
+    fake_keychain: FakeKeychain,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_env = tmp_path / "settings.env"
+    write_env_file({"PLAUD_AUTHORIZATION": "legacy-placeholder"}, settings_env)
+    fake_keychain.stored = store_mod._serialize({"PLAUD_AUTHORIZATION": "credential-placeholder"})
+    monkeypatch.setattr(
+        store_mod,
+        "KEYCHAIN_SERVICE",
+        store_mod.WINDOWS_COMMUNITY_KEYCHAIN_SERVICE,
+    )
+    monkeypatch.setattr(
+        store_mod,
+        "APP_SUPPORT_ID",
+        store_mod.WINDOWS_COMMUNITY_APP_SUPPORT_ID,
+    )
+
+    disconnect_community_credentials(settings_env)
+
+    assert fake_keychain.stored is None
+    assert read_env_file(settings_env) == {}

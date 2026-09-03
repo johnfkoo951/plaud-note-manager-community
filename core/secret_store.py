@@ -1,8 +1,10 @@
-"""Atomic Plaud credential storage backed by the macOS Keychain.
+"""Atomic, OS-native Plaud credential storage for the Community edition.
 
 The Plaud workspace refresh token rotates every time it is used.  Access and
-refresh tokens therefore live in one generic-password item and are replaced as
-one JSON blob.  Non-secret application preferences remain in ``.env``.
+refresh tokens therefore live in one JSON blob and are replaced together.
+macOS stores that blob in Keychain. Windows encrypts it with the current user's
+DPAPI key before writing ``auth.bin`` below the Community LocalAppData folder.
+Non-secret application preferences remain in ``settings.env``.
 
 Legacy ``.env`` credentials are migrated on first read.  The Keychain write is
 read back and verified before any plaintext values are removed from disk.
@@ -10,18 +12,28 @@ read back and verified before any plaintext values are removed from disk.
 
 from __future__ import annotations
 
-import fcntl
 import ctypes
 import json
 import os
+import sys
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
-from keyring.backends.macOS import api as keychain_api
+if sys.platform == "win32":
+    import msvcrt
+    from ctypes import wintypes
+else:
+    import fcntl
+
+    if sys.platform == "darwin":
+        from keyring.backends.macOS import api as keychain_api
 
 COMMUNITY_KEYCHAIN_SERVICE = "com.cmdspace.PlaudNoteManagerCommunity.auth"
 COMMUNITY_APP_SUPPORT_ID = "com.cmdspace.PlaudNoteManagerCommunity"
+WINDOWS_COMMUNITY_KEYCHAIN_SERVICE = "com.cmdspace.PlaudNoteManagerCommunity.WindowsLite.auth"
+WINDOWS_COMMUNITY_APP_SUPPORT_ID = "com.cmdspace.PlaudNoteManagerCommunity.WindowsLite"
 KEYCHAIN_SERVICE = os.environ.get("PLAUD_KEYCHAIN_SERVICE", COMMUNITY_KEYCHAIN_SERVICE)
 KEYCHAIN_ACCOUNT = "plaud-web"
 KEYCHAIN_SCHEMA_VERSION = 1
@@ -48,24 +60,157 @@ KEYCHAIN_OWNED_KEYS = (
     "PLAUD_WS_REFRESH_EXPIRES_AT",
 )
 _KEYCHAIN_OWNED = frozenset(KEYCHAIN_OWNED_KEYS)
+_COMMUNITY_NAMESPACES = frozenset(
+    {
+        (COMMUNITY_KEYCHAIN_SERVICE, COMMUNITY_APP_SUPPORT_ID),
+        (WINDOWS_COMMUNITY_KEYCHAIN_SERVICE, WINDOWS_COMMUNITY_APP_SUPPORT_ID),
+    }
+)
 
 
 class CredentialStoreError(RuntimeError):
-    """The Keychain could not safely read, write, or verify credentials."""
+    """The native secret store could not safely handle credentials."""
 
 
 def _file_backend_for_tests() -> bool:
     """Compatibility backend used only by the test suite.
 
     Production deliberately has no silent plaintext fallback: if the login
-    Keychain is locked or unavailable, callers receive a clear error and the
+    native secret store is unavailable, callers receive a clear error and the
     legacy file is preserved byte-for-byte.
     """
 
     return os.environ.get("PLAUD_SECRET_STORE") == "test-file"
 
 
+def _windows_blob_path() -> Path:
+    explicit = os.environ.get("PLAUD_AUTH_BLOB_FILE")
+    if explicit:
+        return Path(explicit).expanduser()
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        raise CredentialStoreError("Windows LocalAppData is unavailable")
+    return Path(local_app_data) / "CMDSPACE" / APP_SUPPORT_ID / "auth.bin"
+
+
+if sys.platform == "win32":
+    _CRYPTPROTECT_UI_FORBIDDEN = 0x1
+
+    class _DataBlob(ctypes.Structure):
+        _fields_ = [
+            ("cbData", wintypes.DWORD),
+            ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+        ]
+
+    _crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _crypt32.CryptProtectData.argtypes = (
+        ctypes.POINTER(_DataBlob),
+        wintypes.LPCWSTR,
+        ctypes.POINTER(_DataBlob),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(_DataBlob),
+    )
+    _crypt32.CryptProtectData.restype = wintypes.BOOL
+    _crypt32.CryptUnprotectData.argtypes = (
+        ctypes.POINTER(_DataBlob),
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(_DataBlob),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(_DataBlob),
+    )
+    _crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    _kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    _kernel32.LocalFree.restype = ctypes.c_void_p
+
+
+def _blob_input(data: bytes):
+    backing = ctypes.create_string_buffer(data)
+    blob = _DataBlob(len(data), ctypes.cast(backing, ctypes.POINTER(ctypes.c_ubyte)))
+    return blob, backing
+
+
+def _dpapi_protect(data: bytes) -> bytes:
+    source, backing = _blob_input(data)
+    protected = _DataBlob()
+    ok = _crypt32.CryptProtectData(
+        ctypes.byref(source),
+        "Plaud Note Manager Community credentials",
+        None,
+        None,
+        None,
+        _CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(protected),
+    )
+    del backing
+    if not ok:
+        raise CredentialStoreError(
+            f"Windows DPAPI could not encrypt credentials ({ctypes.get_last_error()})"
+        )
+    try:
+        return ctypes.string_at(protected.pbData, protected.cbData)
+    finally:
+        _kernel32.LocalFree(protected.pbData)
+
+
+def _dpapi_unprotect(data: bytes) -> bytes:
+    source, backing = _blob_input(data)
+    plain = _DataBlob()
+    ok = _crypt32.CryptUnprotectData(
+        ctypes.byref(source),
+        None,
+        None,
+        None,
+        None,
+        _CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(plain),
+    )
+    del backing
+    if not ok:
+        raise CredentialStoreError(
+            f"Windows DPAPI could not decrypt credentials ({ctypes.get_last_error()})"
+        )
+    try:
+        return ctypes.string_at(plain.pbData, plain.cbData)
+    finally:
+        _kernel32.LocalFree(plain.pbData)
+
+
+def _atomic_write_private(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp_path, flags, 0o600)
+    try:
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def _native_read() -> str | None:
+    if sys.platform == "win32":
+        path = _windows_blob_path()
+        if not path.exists():
+            return None
+        try:
+            encrypted = path.read_bytes()
+            return _dpapi_unprotect(encrypted).decode("utf-8")
+        except CredentialStoreError:
+            raise
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CredentialStoreError("Windows credential file could not be read") from exc
+    if sys.platform != "darwin":
+        raise CredentialStoreError("native credential storage is unsupported on this platform")
     try:
         return keychain_api.find_generic_password(
             None, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, not_found_ok=True
@@ -75,7 +220,18 @@ def _native_read() -> str | None:
 
 
 def _native_replace(payload: str) -> None:
-    """Add or atomically update the generic-password data via Security.framework."""
+    """Atomically replace the OS-protected credential payload."""
+
+    if sys.platform == "win32":
+        try:
+            _atomic_write_private(_windows_blob_path(), _dpapi_protect(payload.encode("utf-8")))
+        except CredentialStoreError:
+            raise
+        except OSError as exc:
+            raise CredentialStoreError("Windows could not save encrypted credentials") from exc
+        return
+    if sys.platform != "darwin":
+        raise CredentialStoreError("native credential storage is unsupported on this platform")
 
     sec_item_update = keychain_api._sec.SecItemUpdate
     sec_item_update.restype = keychain_api.OS_status
@@ -112,6 +268,14 @@ def _native_replace(payload: str) -> None:
 
 
 def _native_delete() -> None:
+    if sys.platform == "win32":
+        try:
+            _windows_blob_path().unlink(missing_ok=True)
+        except OSError as exc:
+            raise CredentialStoreError("Windows could not remove encrypted credentials") from exc
+        return
+    if sys.platform != "darwin":
+        raise CredentialStoreError("native credential storage is unsupported on this platform")
     try:
         keychain_api.delete_generic_password(None, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
     except keychain_api.NotFound:
@@ -166,10 +330,10 @@ def _write_keychain(values: Mapping[str, str]) -> None:
             _native_replace(payload)
             if _read_keychain() == expected:
                 return
-            last_error = CredentialStoreError("macOS Keychain credential verification failed")
+            last_error = CredentialStoreError("native credential verification failed")
         except CredentialStoreError as exc:
             last_error = exc
-    raise last_error or CredentialStoreError("macOS Keychain could not save credentials")
+    raise last_error or CredentialStoreError("native credential store could not save credentials")
 
 
 def _delete_keychain() -> None:
@@ -179,7 +343,36 @@ def _delete_keychain() -> None:
 def _lock_path(env_path: Path) -> Path:
     if _file_backend_for_tests():
         return env_path.with_name(env_path.name + ".lock")
+    if sys.platform == "win32":
+        return _windows_blob_path().with_name("auth.lock")
     return Path.home() / "Library" / "Application Support" / APP_SUPPORT_ID / "auth.lock"
+
+
+def _lock_fd(fd: int) -> None:
+    if sys.platform != "win32":
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    if os.fstat(fd).st_size == 0:
+        os.write(fd, b"\0")
+        os.fsync(fd)
+    deadline = time.monotonic() + 30
+    while True:
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise CredentialStoreError("timed out waiting for the credential lock") from exc
+            time.sleep(0.1)
+
+
+def _unlock_fd(fd: int) -> None:
+    if sys.platform != "win32":
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 @contextmanager
@@ -188,12 +381,16 @@ def credential_lock(env_path: Path) -> Iterator[None]:
 
     lock_path = _lock_path(env_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    fd = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_fd(fd)
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        _unlock_fd(fd)
         os.close(fd)
 
 
@@ -317,7 +514,7 @@ def disconnect_community_credentials(env_path: Path) -> None:
     recordings, transcripts, caches, and the SQLite database are untouched.
     """
 
-    if KEYCHAIN_SERVICE != COMMUNITY_KEYCHAIN_SERVICE or APP_SUPPORT_ID != COMMUNITY_APP_SUPPORT_ID:
+    if (KEYCHAIN_SERVICE, APP_SUPPORT_ID) not in _COMMUNITY_NAMESPACES:
         raise CredentialStoreError("disconnect refused outside the Community credential namespace")
 
     with credential_lock(env_path):

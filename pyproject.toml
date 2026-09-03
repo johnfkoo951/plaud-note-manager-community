@@ -1,7 +1,7 @@
 [project]
 name = "plaud-note-manager-community"
-version = "0.1.0"
-description = "Privacy-limited Plaud library manager for community workshops"
+version = "0.2.0"
+description = "Privacy-limited Plaud library manager for macOS and Windows workshops"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",

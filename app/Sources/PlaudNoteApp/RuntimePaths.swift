@@ -137,9 +137,22 @@ enum RuntimePaths {
         environment["PLAUD_AUTO_REFRESH"] = "1"
 
         if isPackagedApp, let resources = Bundle.main.resourceURL {
-            environment["SSL_CERT_FILE"] = resources
-                .appendingPathComponent("python/lib/python3.12/site-packages/certifi/cacert.pem")
-                .path
+            let pythonLib = resources
+                .appendingPathComponent("python/lib", isDirectory: true)
+            if let versions = try? FileManager.default.contentsOfDirectory(
+                at: pythonLib,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ), let standardLibrary = versions
+                .filter({ $0.lastPathComponent.hasPrefix("python3.") })
+                .sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+                .last {
+                let certificate = standardLibrary
+                    .appendingPathComponent("site-packages/certifi/cacert.pem")
+                if FileManager.default.fileExists(atPath: certificate.path) {
+                    environment["SSL_CERT_FILE"] = certificate.path
+                }
+            }
         }
         return environment
     }

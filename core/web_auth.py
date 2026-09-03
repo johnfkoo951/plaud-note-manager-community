@@ -7,11 +7,10 @@ from pathlib import Path
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
-from cli.onboard import DEFAULTS
-
 from .auth_status import _decode_jwt_payload, auth_rejected_at
 from .client import PlaudAPIError, PlaudClient
 from .config import PlaudConfig, resolve_env_path
+from .curl_auth import DEFAULTS
 from .secret_store import (
     CredentialStoreError,
     credential_lock,

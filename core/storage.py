@@ -18,6 +18,18 @@ DEFAULT_DB = DATA_DIR / "plaud.db"
 # Bump when SCHEMA_TABLES/_migrate change; gates the migration fast-path.
 SCHEMA_VERSION = 2
 
+
+def _tighten_private_file(path: Path, mode: int) -> None:
+    """Apply POSIX privacy bits where they exist.
+
+    Windows protection comes from the current user's LocalAppData ACL; chmod's
+    read-only emulation there is neither useful nor equivalent to a Unix mode.
+    """
+
+    if os.name == "posix":
+        os.chmod(path, mode)
+
+
 SCHEMA_TABLES = """
 CREATE TABLE IF NOT EXISTS files (
     id          TEXT PRIMARY KEY,
@@ -139,7 +151,7 @@ CREATE INDEX IF NOT EXISTS note_reuse_channel_idx ON note_reuse(channel, status)
 class Storage:
     def __init__(self, db_path: Path = DEFAULT_DB) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(db_path.parent, 0o700)
+        _tighten_private_file(db_path.parent, 0o700)
         self._db_path = db_path
         self._fts_ok = False
         with self._connect() as conn:
@@ -297,7 +309,7 @@ class Storage:
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self._db_path)
-        os.chmod(self._db_path, 0o600)
+        _tighten_private_file(self._db_path, 0o600)
         conn.row_factory = sqlite3.Row
         # WAL mode lets Swift readers/writers and Python writers share the
         # database concurrently without locking each other out.
@@ -308,7 +320,7 @@ class Storage:
         for suffix in ("-wal", "-shm"):
             sidecar = Path(f"{self._db_path}{suffix}")
             if sidecar.exists():
-                os.chmod(sidecar, 0o600)
+                _tighten_private_file(sidecar, 0o600)
         try:
             yield conn
             conn.commit()
@@ -320,7 +332,7 @@ class Storage:
             for suffix in ("", "-wal", "-shm"):
                 path = Path(f"{self._db_path}{suffix}")
                 if path.exists():
-                    os.chmod(path, 0o600)
+                    _tighten_private_file(path, 0o600)
 
     # ---------- files ----------
 

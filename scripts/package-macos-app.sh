@@ -10,13 +10,29 @@ VERSION="${VERSION:-0.0.0}"
 BUILD="$(git -C "$ROOT_DIR" rev-list --count HEAD 2>/dev/null || date +%y%m%d%H%M)"
 GIT_SHA="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo source-archive)"
 ICON_SOURCE="${ICON_SOURCE:-$ROOT_DIR/app/Resources/AppIcon.png}"
+ICON_ICNS_SOURCE="${ICON_ICNS_SOURCE:-$ROOT_DIR/app/Resources/AppIcon.icns}"
 SIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+TARGET_ARCH="${TARGET_ARCH:-arm64}"
+case "$TARGET_ARCH" in
+  arm64)
+    SWIFT_TRIPLE="arm64-apple-macosx14.0"
+    PYTHON_REQUEST="${UV_PYTHON_REQUEST:-cpython-3.12.13-macos-aarch64-none}"
+    ;;
+  x86_64)
+    SWIFT_TRIPLE="x86_64-apple-macosx14.0"
+    PYTHON_REQUEST="${UV_PYTHON_REQUEST:-cpython-3.12.13-macos-x86_64-none}"
+    ;;
+  *)
+    echo "error: TARGET_ARCH must be arm64 or x86_64" >&2
+    exit 64
+    ;;
+esac
 DIST_DIR="$ROOT_DIR/dist"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/plaud-community-package.XXXXXX")"
 STAGE_APP="$TMP_DIR/$APP_NAME.app"
-STAGE_ZIP="$TMP_DIR/$APP_NAME-$VERSION-macOS-arm64.zip"
+STAGE_ZIP="$TMP_DIR/$APP_NAME-$VERSION-macOS-$TARGET_ARCH.zip"
 FINAL_APP="$DIST_DIR/$APP_NAME.app"
-FINAL_ZIP="$DIST_DIR/$APP_NAME-$VERSION-macOS-arm64.zip"
+FINAL_ZIP="$DIST_DIR/$APP_NAME-$VERSION-macOS-$TARGET_ARCH.zip"
 SWIFT_SCRATCH="$TMP_DIR/swift-build"
 
 cleanup() {
@@ -31,7 +47,7 @@ fail() {
   exit 1
 }
 
-[[ "$(uname -m)" == "arm64" ]] || fail "this workshop build currently supports Apple silicon only"
+[[ "$(uname -s)" == "Darwin" ]] || fail "macOS packages must be built on macOS"
 [[ -f "$ICON_SOURCE" ]] || fail "missing icon source: $ICON_SOURCE"
 command -v uv >/dev/null || fail "uv is required to build the release"
 command -v swift >/dev/null || fail "Swift is required to build the release"
@@ -41,9 +57,15 @@ if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   [[ -z "$DIRTY" ]] || fail "commit or stash source changes before packaging"
 fi
 
-PYTHON_BIN="$(uv python find 3.12)"
+UV_CACHE_DIR="${UV_CACHE_DIR:-$TMP_DIR/uv-cache}"
+UV_PYTHON_INSTALL_DIR="$TMP_DIR/uv-python"
+export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR
+uv python install --no-bin "$PYTHON_REQUEST"
+PYTHON_BIN="$(uv python find --managed-python "$PYTHON_REQUEST")"
 PYTHON_HOME="$(cd "$(dirname "$PYTHON_BIN")/.." && pwd -P)"
 [[ -x "$PYTHON_HOME/bin/python3" ]] || fail "uv-managed Python 3.12 was not found"
+[[ "$(/usr/bin/lipo -archs "$PYTHON_BIN")" == "$TARGET_ARCH" ]] || \
+  fail "Python architecture does not match $TARGET_ARCH: $PYTHON_BIN"
 
 mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Resources/runtime/templates"
 
@@ -51,6 +73,9 @@ echo "Building Swift application..."
 swift build \
   --package-path "$ROOT_DIR/app" \
   --scratch-path "$SWIFT_SCRATCH" \
+  --disable-sandbox \
+  --disable-automatic-resolution \
+  --triple "$SWIFT_TRIPLE" \
   -c release \
   -Xswiftc -gnone \
   -Xswiftc -file-prefix-map \
@@ -63,6 +88,7 @@ swift build \
   -Xswiftc "$TMP_DIR=/BUILD"
 
 BIN_DIR="$(swift build --package-path "$ROOT_DIR/app" --scratch-path "$SWIFT_SCRATCH" \
+  --disable-sandbox --disable-automatic-resolution --triple "$SWIFT_TRIPLE" \
   -c release --show-bin-path)"
 BUILD_BINARY="$BIN_DIR/$EXECUTABLE_NAME"
 [[ -x "$BUILD_BINARY" ]] || fail "build binary not found: $BUILD_BINARY"
@@ -136,19 +162,17 @@ if [[ -f "$GRDB_LICENSE" ]]; then
     "$STAGE_APP/Contents/Resources/runtime/GRDB_LICENSE"
 fi
 
-ICONSET="$TMP_DIR/AppIcon.iconset"
-mkdir -p "$ICONSET"
-sips -z 16 16 "$ICON_SOURCE" --out "$ICONSET/icon_16x16.png" >/dev/null
-sips -z 32 32 "$ICON_SOURCE" --out "$ICONSET/icon_16x16@2x.png" >/dev/null
-sips -z 32 32 "$ICON_SOURCE" --out "$ICONSET/icon_32x32.png" >/dev/null
-sips -z 64 64 "$ICON_SOURCE" --out "$ICONSET/icon_32x32@2x.png" >/dev/null
-sips -z 128 128 "$ICON_SOURCE" --out "$ICONSET/icon_128x128.png" >/dev/null
-sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET/icon_128x128@2x.png" >/dev/null
-sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET/icon_256x256.png" >/dev/null
-sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET/icon_256x256@2x.png" >/dev/null
-sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET/icon_512x512.png" >/dev/null
-sips -z 1024 1024 "$ICON_SOURCE" --out "$ICONSET/icon_512x512@2x.png" >/dev/null
-iconutil -c icns "$ICONSET" -o "$STAGE_APP/Contents/Resources/AppIcon.icns"
+if [[ -f "$ICON_ICNS_SOURCE" ]]; then
+  /usr/bin/ditto "$ICON_ICNS_SOURCE" "$STAGE_APP/Contents/Resources/AppIcon.icns"
+else
+  ICON_PNGS="$TMP_DIR/AppIcon.pngs"
+  mkdir -p "$ICON_PNGS"
+  for size in 16 32 64 128 256 512 1024; do
+    sips -z "$size" "$size" "$ICON_SOURCE" --out "$ICON_PNGS/icon_$size.png" >/dev/null
+  done
+  /usr/bin/python3 "$ROOT_DIR/scripts/make-icns.py" \
+    "$ICON_PNGS" "$STAGE_APP/Contents/Resources/AppIcon.icns"
+fi
 
 /usr/libexec/PlistBuddy -c 'Clear dict' "$STAGE_APP/Contents/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleName string $APP_NAME" "$STAGE_APP/Contents/Info.plist"
@@ -163,7 +187,7 @@ iconutil -c icns "$ICONSET" -o "$STAGE_APP/Contents/Resources/AppIcon.icns"
 /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string AppIcon' "$STAGE_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :LSMinimumSystemVersion string 14.0' "$STAGE_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :LSArchitecturePriority array' "$STAGE_APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c 'Add :LSArchitecturePriority:0 string arm64' "$STAGE_APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :LSArchitecturePriority:0 string $TARGET_ARCH" "$STAGE_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :LSApplicationCategoryType string public.app-category.productivity' "$STAGE_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :NSHighResolutionCapable bool true' "$STAGE_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :NSQuitAlwaysKeepsWindows bool false' "$STAGE_APP/Contents/Info.plist"
@@ -190,8 +214,8 @@ fi
 mv "$STAGE_APP" "$FINAL_APP"
 mv "$STAGE_ZIP" "$FINAL_ZIP"
 
-(cd "$DIST_DIR" && shasum -a 256 "$(basename "$FINAL_ZIP")" > SHA256SUMS)
-"$ROOT_DIR/scripts/audit-release.sh" "$FINAL_APP"
+/usr/bin/python3 "$ROOT_DIR/scripts/update-checksums.py" "$DIST_DIR"
+"$ROOT_DIR/scripts/audit-release.sh" "$FINAL_APP" "$TARGET_ARCH"
 
 echo
 echo "Release ready:"

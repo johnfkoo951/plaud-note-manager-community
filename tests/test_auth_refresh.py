@@ -34,6 +34,13 @@ curl 'https://api-apne1.plaud.ai/summary/community/templates/weekly_recommend' \
   --data-raw '{{"language_os":"en"}}'
 """
 
+WINDOWS_CMD_CURL = f"""
+curl ^"https://api-us1.plaud.ai/file/simple/web?limit=1^" ^
+  -H ^"{AUTHORIZATION_HEADER}: Bearer windows.test.token^" ^
+  -H ^"x-device-id: windows-device^" ^
+  -b ^"session=windows-cookie; preference=ko^"
+"""
+
 
 def test_refresh_auth_keeps_curl_clipboard_concept_and_cookie(tmp_path, monkeypatch) -> None:
     for key in (
@@ -99,6 +106,22 @@ def test_refresh_auth_accepts_single_line_curl_and_region_host(tmp_path, monkeyp
     cfg = load_config(env_path)
     assert cfg.base_url == "https://api-eu1.plaud.ai"
     assert "x-pld-user" not in cfg.headers()
+
+
+def test_refresh_auth_accepts_chrome_windows_cmd_curl(tmp_path, monkeypatch) -> None:
+    for key in ("PLAUD_AUTHORIZATION", "PLAUD_X_DEVICE_ID", "PLAUD_COOKIE"):
+        monkeypatch.delenv(key, raising=False)
+
+    env_path = tmp_path / ".env"
+    result = refresh_auth(env_path=env_path, curl_text=WINDOWS_CMD_CURL)
+
+    assert result.status == "ok"
+    assert result.cookie_captured is True
+    cfg = load_config(env_path)
+    assert cfg.base_url == "https://api-us1.plaud.ai"
+    assert cfg.headers()["authorization"] == "Bearer windows.test.token"
+    assert cfg.headers()["x-device-id"] == "windows-device"
+    assert cfg.headers()["cookie"] == "session=windows-cookie; preference=ko"
 
 
 def test_refresh_auth_rejects_non_plaud_target_without_writing(tmp_path) -> None:

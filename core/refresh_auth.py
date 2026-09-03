@@ -6,9 +6,10 @@ The source of truth remains the user's browser-copied cURL:
     2. Copy an authenticated API request as cURL.
     3. Run `uv run plaud refresh-auth` or click the app's refresh button.
 
-This helper reads the macOS pasteboard, parses the cURL with the same parser as
-`plaud onboard`, and writes the auth bundle to macOS Keychain. Tokens/cookies
-are never printed or passed in a process argument.
+This helper accepts cURL text directly (the Windows UI path), or reads the
+macOS pasteboard for the native Mac app. It parses with the same parser as
+`plaud onboard` and writes to the OS-native protected store. Tokens/cookies are
+never printed or passed in a process argument.
 """
 
 from __future__ import annotations
@@ -16,14 +17,11 @@ from __future__ import annotations
 import subprocess
 import time
 from collections.abc import Callable, Mapping
-from contextlib import redirect_stdout
 from dataclasses import dataclass
-from io import StringIO
 from pathlib import Path
 
-from cli.onboard import parse_curl, write_env
-
 from .config import resolve_env_path
+from .curl_auth import parse_curl, store_credentials
 from .secret_store import CredentialStoreError
 
 
@@ -60,7 +58,7 @@ def refresh_auth(
     validate_live: bool = False,
     live_validator: LiveValidator | None = None,
 ) -> RefreshResult:
-    """Parse a copied Plaud cURL and write fresh credentials to Keychain.
+    """Parse copied Plaud cURL and write fresh credentials to the native store.
 
     App callers request a live validation so a rejected candidate never
     replaces the last usable file. CLI/tests can keep the local-only default.
@@ -80,7 +78,7 @@ def refresh_auth(
 
     try:
         values = parse_curl(curl_text)
-    except SystemExit as exc:
+    except ValueError as exc:
         return RefreshResult("invalid_curl", str(exc))
 
     # Reject a locally-decodable expired JWT without touching disk. Opaque
@@ -97,19 +95,15 @@ def refresh_auth(
         if verdict == "rejected":
             return RefreshResult(
                 "live_auth_failed",
-                "Plaud rejected the copied credentials; Keychain unchanged",
+                "Plaud rejected the copied credentials; saved credentials unchanged",
                 cookie_captured="PLAUD_COOKIE" in values,
             )
         if verdict == "unreachable":
             status = "live_check_unavailable"
             detail = "credentials saved but could not be verified — check your network connection"
 
-    # `write_env()` is intentionally chatty for terminal onboarding, but this
-    # helper is consumed by the app as JSON. Keep stdout clean so the Swift UI
-    # can decode `plaud refresh-auth --json` reliably.
     try:
-        with redirect_stdout(StringIO()):
-            write_env(values, env_path)
+        store_credentials(values, env_path)
     except (OSError, CredentialStoreError) as exc:
         return RefreshResult("write_failed", f"could not update credentials: {exc}")
     return RefreshResult(

@@ -90,6 +90,9 @@ class PlaudClient:
             # different origin. Plaud API calls are expected to answer on the
             # validated regional API host directly.
             follow_redirects=False,
+            # Do not inherit host proxy credentials or routing from a shell.
+            # A restricted workshop build talks directly to Plaud endpoints.
+            trust_env=False,
         )
 
     def __enter__(self) -> "PlaudClient":
@@ -124,7 +127,7 @@ class PlaudClient:
 
     def _external_request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         try:
-            resp = httpx.request(method, url, **kwargs)
+            resp = httpx.request(method, url, trust_env=False, **kwargs)
             resp.raise_for_status()
             return resp
         except httpx.HTTPStatusError as exc:

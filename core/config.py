@@ -1,4 +1,4 @@
-"""Load Plaud credentials from macOS Keychain + non-secret .env settings."""
+"""Load Plaud credentials from the OS secret store plus non-secret settings."""
 
 from __future__ import annotations
 
@@ -78,9 +78,9 @@ def read_env_file(env_path: Path) -> dict[str, str]:
 def write_env_file(values: Mapping[str, str], env_path: Path) -> None:
     """Write the machine-managed `.env` with 0600 permissions.
 
-    Plaud credentials now live in macOS Keychain; this file retains non-secret
-    preferences and is also the legacy/test backend.  The write remains atomic
-    so migration and preference updates cannot leave a torn file.
+    Plaud credentials live in the OS-native protected store; this file retains
+    non-secret preferences and is also the legacy/test backend. The write
+    remains atomic so migration and preference updates cannot leave a torn file.
     """
     content = "\n".join(f"{key}={env_quote(value)}" for key, value in values.items()) + "\n"
     env_path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,9 +96,10 @@ def write_env_file(values: Mapping[str, str], env_path: Path) -> None:
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
-    # os.replace carries the temp file's 0600 over, but tighten explicitly in
-    # case a pre-existing umask/ACL loosened it.
-    os.chmod(env_path, 0o600)
+    # POSIX modes do not model Windows ACLs. On macOS tighten explicitly; on
+    # Windows the file is non-secret and lives below per-user LocalAppData.
+    if os.name == "posix":
+        os.chmod(env_path, 0o600)
 
 
 def update_env_file(updates: Mapping[str, str | None], env_path: Path) -> None:
@@ -183,7 +184,7 @@ def load_config(env_file: Path | None = None) -> PlaudConfig:
     _maybe_auto_refresh(env_path)
 
     # Migrate legacy plaintext credentials before python-dotenv can copy them
-    # into the process environment.  Keychain is authoritative once present.
+    # into the process environment. The native secret store is authoritative.
     from .secret_store import CredentialStoreError, KEYCHAIN_OWNED_KEYS, load_credential_values
 
     try:
