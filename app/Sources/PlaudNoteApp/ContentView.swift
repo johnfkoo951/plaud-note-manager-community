@@ -106,11 +106,11 @@ enum AppVersion {
     static var build: String { info("CFBundleVersion") ?? "0" }
     static var sha: String { info("PlaudGitSHA") ?? "local" }
 
-    /// "Plaud Note Manager v0.3.0 (build 142 · a1b2c3d)" for the settings footer.
+    /// "Plaud Note Manager v0.4.0 (build 142 · a1b2c3d)" for the settings footer.
     static var longLine: String {
         "Plaud Note Manager v\(shortVersion) (build \(build) · \(sha))"
     }
-    /// "v0.3.0 (142)" for the tiny sidebar footer.
+    /// "v0.4.0 (142)" for the tiny sidebar footer.
     static var shortLine: String {
         "v\(shortVersion) (\(build))"
     }
