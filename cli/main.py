@@ -54,6 +54,8 @@ COMMUNITY_ALLOWED_COMMANDS = frozenset(
         "peek",
         "brief",
         "outline-of",
+        "official-read",
+        "official-status",
         "deep",
         "query",
         "resources",
@@ -83,6 +85,7 @@ COMMUNITY_ALLOWED_COMMANDS = frozenset(
         "ws-refresh",
         "ws-bootstrap",
         "metadata",
+        "metadata-auto",
         "usage-status",
         "tags",
         "tag-add",
@@ -900,6 +903,48 @@ _AUTH_ICON = {
 }
 
 
+@safe_command(name="official-status")
+def official_status_cmd(
+    json_out: bool = typer.Option(False, "--json"),
+    live: bool = typer.Option(
+        False, "--live", help="Validate the official CLI's separate OAuth connection."
+    ),
+) -> None:
+    """Inspect the official @plaud-ai/cli read connection without importing tokens."""
+    from core.official_cli import status
+
+    result = status(live=live)
+    if json_out:
+        _emit_json(result)
+    else:
+        console.print_json(data=result)
+
+
+@safe_command(name="official-read")
+def official_read_cmd(
+    file_id: str = typer.Argument(...),
+    kind: str = typer.Option("summary", help="summary or transcript"),
+    block: str = typer.Option(
+        "transaction", help="Transcript block, e.g. transaction_polish or outline."
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Read through official OAuth; never changes Plaud records or the local cache."""
+    from core.official_cli import OfficialCLIError, read_recording
+
+    try:
+        result = {"status": "ok", **read_recording(file_id, kind=kind, block=block)}
+    except OfficialCLIError as exc:
+        result = {"status": exc.code, "detail": exc.detail}
+    if json_out:
+        _emit_json(result)
+        return
+    if result["status"] != "ok":
+        console.print(f"[red]{result['status']}[/red] — {result['detail']}")
+        raise typer.Exit(1)
+    console.print_json(data=result)
+
+
 @safe_command(name="auth")
 def auth_cmd(
     json_out: bool = typer.Option(False, "--json"),
@@ -1357,6 +1402,71 @@ def metadata_show(file_id: str) -> None:
         "references": [dict(r) for r in storage.list_note_references(file_id)],
     }
     console.print_json(json=_json.dumps(payload, ensure_ascii=False))
+
+
+@safe_command(name="metadata-auto")
+def metadata_auto(
+    limit: int = typer.Option(0, "--limit", min=0, help="Max files this run. 0 = configured limit."),
+    since_days: int = typer.Option(
+        7, "--since-days", min=0, help="Only files whose content was cached in the last N days."
+    ),
+    backfill: bool = typer.Option(
+        False, "--backfill", help="Ignore recency — process the whole backlog."
+    ),
+    provider: str = typer.Option(
+        "",
+        "--provider",
+        help=MODEL_HELP + ". Required; never inferred as consent.",
+    ),
+    backend: str = typer.Option(
+        "",
+        "--backend",
+        help="cli (vendor app/OAuth) or api (protected API key). Required.",
+    ),
+    confirm_external: bool = typer.Option(
+        False,
+        "--confirm-external",
+        help=(
+            "Confirm this run may send each recording's transcript or summary "
+            "to the selected provider. One call is billed per file."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="List what would be generated, change nothing."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print the report as JSON."),
+) -> None:
+    """Generate local metadata (title, description, type, tags) for eligible files.
+
+    Eligible means: a transcript or summary is cached and the source text has
+    changed since the last successful run. Nothing is sent anywhere without
+    --confirm-external, and no folder is ever moved by this command.
+    """
+    import json as _json
+    from dataclasses import asdict
+
+    from core.auto_metadata import run_auto_metadata
+
+    report = run_auto_metadata(
+        Storage(),
+        provider=provider,
+        backend=backend,
+        confirmed_external=confirm_external,
+        limit=limit or None,
+        since_days=since_days,
+        backfill=backfill,
+        dry_run=dry_run,
+    )
+    if json_output:
+        console.print_json(json=_json.dumps(asdict(report), ensure_ascii=False))
+        return
+    console.print(report.summary())
+    if report.aborted:
+        console.print(f"  [yellow]stopped[/yellow] — {report.aborted}")
+    for file_id, err in report.failed.items():
+        console.print(f"  [red]failed[/red] {file_id}: {err[:120]}")
+    if report.remaining:
+        console.print(f"  [yellow]{report.remaining} more eligible[/yellow] — run again or raise --limit")
 
 
 @safe_command(name="usage-status")
