@@ -41,6 +41,33 @@ def test_set_file_folders_allows_single_and_clear(monkeypatch: pytest.MonkeyPatc
     ]
 
 
+def test_set_file_folders_once_uses_non_retrying_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client()
+    calls: list[tuple[str, str, dict]] = []
+
+    class Response:
+        @staticmethod
+        def json() -> dict:
+            return {"status": 0}
+
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda method, path, **kwargs: calls.append((method, path, kwargs["json"])) or Response(),
+    )
+    monkeypatch.setattr(
+        client,
+        "_patch_json",
+        lambda *_args, **_kwargs: pytest.fail("retrying PATCH helper was used"),
+    )
+
+    client.set_file_folders_once("f1", ["a"])
+
+    assert calls == [("PATCH", "/file/f1", {"filetag_id_list": ["a"]})]
+
+
 def test_storage_files_with_multiple_folders(tmp_path: Path) -> None:
     storage = Storage(db_path=tmp_path / "test.db")
     with storage._connect() as conn:

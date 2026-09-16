@@ -8,7 +8,7 @@ the user clicks it on `https://web.plaud.ai`, capture the minimum Plaud
 authentication bundle needed by the installed app, send it directly to a
 registered native messaging host, and then discard it.
 
-This is a follow-up project, not part of Community 0.2.2. The manual cURL import
+This is a follow-up project, not part of Community 0.3.0. The manual cURL import
 remains the emergency path until the native bridge passes the acceptance gates
 below.
 

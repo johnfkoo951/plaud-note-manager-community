@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 import Foundation
 
 /// Snapshot of Plaud credential health, mirroring the JSON emitted by
@@ -138,6 +139,56 @@ final class FileStore: ObservableObject {
     @Published var elevenLabs: ElevenLabsStatus?
     private var elevenLabsFetchedAt: Date?
 
+    enum CommunityElevenLabsRetryState: Equatable {
+        case clear
+        case outcomeUnknown
+    }
+
+    private struct CommunityElevenLabsAttemptPayload: Decodable {
+        let status: String
+        let retryMayBillTwice: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case status
+            case retryMayBillTwice = "retry_may_bill_twice"
+        }
+    }
+
+    nonisolated static func communityElevenLabsRetryState(
+        from output: String
+    ) -> CommunityElevenLabsRetryState? {
+        guard let data = output.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(
+                  CommunityElevenLabsAttemptPayload.self,
+                  from: data
+              )
+        else { return nil }
+        switch (payload.status, payload.retryMayBillTwice) {
+        case ("clear", false):
+            return .clear
+        case ("outcome_unknown", true):
+            return .outcomeUnknown
+        default:
+            return nil
+        }
+    }
+
+    nonisolated static func communityElevenLabsArguments(
+        fileID: String,
+        numSpeakers: Int,
+        replacingExisting: Bool,
+        retryOutcomeUnknown: Bool
+    ) -> [String] {
+        var args = ["elevenlabs-transcribe", fileID, "--confirm-upload", "--json"]
+        if replacingExisting || retryOutcomeUnknown {
+            args.append("--force")
+        }
+        if numSpeakers > 0 {
+            args += ["--num-speakers", String(numSpeakers)]
+        }
+        return args
+    }
+
     /// Fetch the ElevenLabs balance, throttled to every 30 min — it's a
     /// passive indicator, not something worth an API call per sync. Pass
     /// force after transcription runs, which actually spend credits.
@@ -213,10 +264,23 @@ final class FileStore: ObservableObject {
 
     var selectedFile: PlaudFileVM? { files.first { $0.id == selectedID } }
 
-    private struct CommandResult {
+    struct CommandResult {
         let exitCode: Int32
         let stdout: String
         let stderr: String
+        let forceKilled: Bool
+
+        init(
+            exitCode: Int32,
+            stdout: String,
+            stderr: String,
+            forceKilled: Bool = false
+        ) {
+            self.exitCode = exitCode
+            self.stdout = stdout
+            self.stderr = stderr
+            self.forceKilled = forceKilled
+        }
 
         var ok: Bool { exitCode == 0 }
 
@@ -319,6 +383,65 @@ final class FileStore: ObservableObject {
         }
     }
 
+    /// Thread-safe storage used by the stdout/stderr drain workers. Keeping the
+    /// bytes in memory avoids putting command output (or piped secrets) in a
+    /// temporary file while still letting both pipes drain as the child runs.
+    private final class ProcessCaptureBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+
+        func replace(with value: Data) {
+            lock.lock()
+            data = value
+            lock.unlock()
+        }
+
+        func snapshot() -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return data
+        }
+    }
+
+    private final class ProcessTimeoutState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var timedOutValue = false
+        private var forceKilledValue = false
+        private var completedValue = false
+
+        func beginTimeout() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !completedValue else { return false }
+            timedOutValue = true
+            return true
+        }
+
+        func markCompleted() {
+            lock.lock()
+            completedValue = true
+            lock.unlock()
+        }
+
+        func markForceKilled() {
+            lock.lock()
+            forceKilledValue = true
+            lock.unlock()
+        }
+
+        var timedOut: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return timedOutValue
+        }
+
+        var forceKilled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return forceKilledValue
+        }
+    }
+
     init() {
         DatabaseWatcher.shared.start()
         reload()
@@ -334,6 +457,7 @@ final class FileStore: ObservableObject {
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
             .sink { [weak self] _ in
                 Task { @MainActor in
+                    await self?.refreshCommunityUndoStatus()
                     guard self?.auth?.configured == true else {
                         await self?.refreshAuth()
                         return
@@ -387,6 +511,7 @@ final class FileStore: ObservableObject {
         // Show the auth indicator immediately at launch with a cheap offline
         // check, before the (slower, network-bound) initial sync finishes.
         Task {
+            await refreshCommunityUndoStatus()
             await refreshAuth()
             if auth?.configured == true {
                 await sync(showError: false)
@@ -816,11 +941,19 @@ final class FileStore: ObservableObject {
     @Published var classifyResult: String?
     /// Decoded dry-run plans driving the preview sheet (nil = sheet closed).
     @Published var classifyPlans: [ClassifyPlan]?
+    /// Exact nonce emitted by the persisted Community preview. Apply must send
+    /// this value back so a newer preview cannot be approved through an older
+    /// sheet.
+    @Published private(set) var classifyPlanID: String?
     /// Set after a successful apply so the file list can offer an undo banner.
     /// `count` = how many recordings were actually moved.
-    @Published var lastClassifyApply: (count: Int, at: Date)?
+    @Published private(set) var lastClassifyApply: (count: Int, at: Date)?
+    @Published private(set) var classifyUndoNeedsRetry = false
+    /// A crash-interrupted apply must first be stabilized. The next explicit
+    /// action only performs that recovery; a second action performs the inverse.
+    @Published private(set) var classifyApplyRecoveryRequired = false
 
-    /// One planned classification, decoded from `plaud classify --json`.
+    /// One planned classification, decoded from the active folder router.
     /// In a dry run (`moved_to == ""`) this is a proposal; the preview lets the
     /// user uncheck wrong matches before applying.
     struct ClassifyPlan: Identifiable, Hashable, Decodable {
@@ -829,6 +962,11 @@ final class FileStore: ObservableObject {
         let folderName: String
         let confidence: Double
         let reason: String
+        let source: String
+        let error: String
+        let applied: Bool
+        let movedTo: String
+        let planID: String
 
         var id: String { fileID }
 
@@ -838,6 +976,11 @@ final class FileStore: ObservableObject {
             case folderName = "folder_name"
             case confidence
             case reason
+            case source
+            case error
+            case applied
+            case movedTo = "moved_to"
+            case planID = "plan_id"
         }
 
         init(from decoder: Decoder) throws {
@@ -847,18 +990,361 @@ final class FileStore: ObservableObject {
             self.folderName = (try? c.decode(String.self, forKey: .folderName)) ?? ""
             self.confidence = (try? c.decode(Double.self, forKey: .confidence)) ?? 0
             self.reason = (try? c.decode(String.self, forKey: .reason)) ?? ""
+            self.source = (try? c.decode(String.self, forKey: .source)) ?? ""
+            self.error = (try? c.decode(String.self, forKey: .error)) ?? ""
+            self.applied = (try? c.decode(Bool.self, forKey: .applied)) ?? false
+            self.movedTo = (try? c.decode(String.self, forKey: .movedTo)) ?? ""
+            self.planID = (try? c.decode(String.self, forKey: .planID)) ?? ""
         }
     }
 
-    /// Run a DRY-RUN classification (`classify --json`, no `--apply`) and
+    struct ClassifyApplySummary: Equatable {
+        let movedCount: Int
+        let failedCount: Int
+        let warningCount: Int
+        let message: String?
+    }
+
+    struct ClassifyUndoSummary: Equatable {
+        let revertedCount: Int
+        let retryCount: Int
+        let completed: Bool
+        let message: String
+    }
+
+    private struct ClassifyUndoPayload: Decodable {
+        struct Failure: Decodable {
+            let fileID: String
+            let error: String
+
+            enum CodingKeys: String, CodingKey {
+                case fileID = "file_id"
+                case error
+            }
+        }
+
+        let status: String
+        let detail: String?
+        let reverted: Int
+        let failed: [Failure]
+
+        enum CodingKeys: String, CodingKey {
+            case status, detail, reverted, failed
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            status = try c.decode(String.self, forKey: .status)
+            detail = try c.decodeIfPresent(String.self, forKey: .detail)
+            reverted = try c.decodeIfPresent(Int.self, forKey: .reverted) ?? 0
+            failed = try c.decodeIfPresent([Failure].self, forKey: .failed) ?? []
+        }
+    }
+
+    struct CommunityUndoAvailability: Equatable {
+        let status: String
+        let count: Int
+        let detail: String
+    }
+
+    private struct CommunityUndoStatusPayload: Decodable {
+        let status: String
+        let count: Int
+        let detail: String
+    }
+
+    nonisolated static func communityUndoAvailability(
+        from output: String
+    ) -> CommunityUndoAvailability? {
+        guard let data = output.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(
+                  CommunityUndoStatusPayload.self,
+                  from: data
+              ),
+              !payload.detail.isEmpty
+        else { return nil }
+        switch payload.status {
+        case "none" where payload.count == 0:
+            break
+        case "undo_available" where payload.count > 0:
+            break
+        case "apply_recovery_required" where payload.count > 0:
+            break
+        default:
+            return nil
+        }
+        return CommunityUndoAvailability(
+            status: payload.status,
+            count: payload.count,
+            detail: payload.detail
+        )
+    }
+
+    nonisolated static func normalizedCommunityBackend(
+        provider: String,
+        storedBackend: String?
+    ) -> String {
+        if provider == "gemini" || provider == "grok" { return "api" }
+        return storedBackend == "api" ? "api" : "cli"
+    }
+
+    nonisolated static func validatedCommunityPlanID(in plans: [ClassifyPlan]) -> String? {
+        guard let planID = plans.first?.planID,
+              isCommunityPlanID(planID),
+              plans.allSatisfy({ $0.planID == planID })
+        else { return nil }
+        return planID
+    }
+
+    nonisolated static func communityApplyArguments(
+        fileIDs: [String],
+        planID: String
+    ) -> [String]? {
+        guard isCommunityPlanID(planID), !fileIDs.isEmpty else { return nil }
+        var seen: Set<String> = []
+        let selected = fileIDs.filter { !$0.isEmpty && seen.insert($0).inserted }
+        guard !selected.isEmpty else { return nil }
+        var args = [
+            "auto-folder", "--apply", "--plan-id", planID,
+            "--min-confidence", "0.6",
+        ]
+        args += selected.flatMap { ["--only", $0] }
+        args.append("--json")
+        return args
+    }
+
+    nonisolated static func communityApplySummary(
+        selectedFileIDs: [String],
+        expectedPlanID: String,
+        results: [ClassifyPlan]
+    ) -> ClassifyApplySummary? {
+        var selectedSeen: Set<String> = []
+        let selected = selectedFileIDs.filter {
+            !$0.isEmpty && selectedSeen.insert($0).inserted
+        }
+        let selectedSet = Set(selected)
+        let resultIDs = results.map(\.fileID)
+        guard isCommunityPlanID(expectedPlanID),
+              !selectedSet.isEmpty,
+              results.count == selectedSet.count,
+              Set(resultIDs) == selectedSet,
+              Set(resultIDs).count == results.count,
+              results.allSatisfy({
+                  $0.planID == expectedPlanID
+                      && isCommunityPlanID($0.planID)
+                      && $0.applied == !$0.movedTo.isEmpty
+              })
+        else { return nil }
+
+        let moved = results.filter(\.applied)
+        let failed = results.filter { !$0.applied }
+        let warned = moved.filter { !$0.error.isEmpty }
+        var messages: [String] = []
+        if !failed.isEmpty {
+            let headline = moved.isEmpty
+                ? "선택한 \(failed.count)개 모두 이동하지 못했습니다."
+                : "\(moved.count)개는 이동했고 \(failed.count)개는 이동하지 못했습니다."
+            let detailLines: [String] = failed.prefix(3).map { row -> String in
+                let error: String = row.error.isEmpty ? "오류 상세 없음" : row.error
+                return "\(row.title): \(error)"
+            }
+            let details: String = detailLines.joined(separator: "\n")
+            var failureMessage = headline
+            if !details.isEmpty {
+                failureMessage += "\n"
+                failureMessage += details
+            }
+            messages.append(failureMessage)
+        }
+        if !warned.isEmpty {
+            let detailLines: [String] = warned.prefix(3).map { row -> String in
+                "\(row.title): \(row.error)"
+            }
+            let details: String = detailLines.joined(separator: "\n")
+            var warningMessage = "이동된 \(warned.count)개의 로컬 캐시 갱신에 경고가 있습니다."
+            if !details.isEmpty {
+                warningMessage += "\n"
+                warningMessage += details
+            }
+            messages.append(warningMessage)
+        }
+        return ClassifyApplySummary(
+            movedCount: moved.count,
+            failedCount: failed.count,
+            warningCount: warned.count,
+            message: messages.isEmpty ? nil : messages.joined(separator: "\n\n")
+        )
+    }
+
+    nonisolated static func communityUndoSummary(
+        from output: String,
+        currentCount: Int
+    ) -> ClassifyUndoSummary? {
+        guard let data = output.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(ClassifyUndoPayload.self, from: data),
+              payload.reverted >= 0,
+              payload.failed.allSatisfy({ !$0.fileID.isEmpty && !$0.error.isEmpty })
+        else { return nil }
+
+        switch payload.status {
+        case "ok":
+            guard payload.failed.isEmpty else { return nil }
+            return ClassifyUndoSummary(
+                revertedCount: payload.reverted,
+                retryCount: 0,
+                completed: true,
+                message: "자동 분류 \(payload.reverted)개를 되돌렸습니다."
+            )
+        case "nothing":
+            guard payload.reverted == 0, payload.failed.isEmpty else { return nil }
+            return ClassifyUndoSummary(
+                revertedCount: 0,
+                retryCount: 0,
+                completed: true,
+                message: payload.detail ?? "되돌릴 자동 분류 기록이 없습니다."
+            )
+        case "partial":
+            guard !payload.failed.isEmpty else { return nil }
+            let retryable = payload.failed.filter {
+                !$0.error.hasPrefix("local cache update failed:")
+            }
+            let warnings = payload.failed.count - retryable.count
+            var message = "자동 분류 \(payload.reverted)개를 되돌렸습니다."
+            if !retryable.isEmpty {
+                message += " \(retryable.count)개는 실패해 다시 시도할 수 있습니다."
+            }
+            if warnings > 0 {
+                message += " \(warnings)개는 로컬 캐시 갱신 경고가 있어 동기화합니다."
+            }
+            return ClassifyUndoSummary(
+                revertedCount: payload.reverted,
+                retryCount: retryable.count,
+                completed: retryable.isEmpty,
+                message: message
+            )
+        case "apply_recovery_required":
+            guard payload.reverted == 0, payload.failed.isEmpty else { return nil }
+            return ClassifyUndoSummary(
+                revertedCount: 0,
+                retryCount: max(currentCount, 1),
+                completed: false,
+                message: payload.detail
+                    ?? "중단된 폴더 적용을 안정화했습니다. 상태를 확인한 뒤 되돌리기를 다시 누르세요."
+            )
+        case "error":
+            guard payload.reverted == 0, payload.failed.isEmpty else { return nil }
+            return ClassifyUndoSummary(
+                revertedCount: 0,
+                retryCount: max(currentCount, 1),
+                completed: false,
+                message: payload.detail ?? "자동 분류 되돌리기에 실패했습니다. 다시 시도할 수 있습니다."
+            )
+        default:
+            return nil
+        }
+    }
+
+    nonisolated private static func isCommunityPlanID(_ value: String) -> Bool {
+        value.utf8.count == 32 && value.utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (97...102).contains(byte)
+        }
+    }
+
+    func dismissClassifyPreview() {
+        classifyPlans = nil
+        classifyPlanID = nil
+    }
+
+    func dismissClassifyUndo() {
+        lastClassifyApply = nil
+        classifyUndoNeedsRetry = false
+        classifyApplyRecoveryRequired = false
+    }
+
+    /// Restore the durable Community undo/recovery affordance without making a
+    /// Plaud request. A malformed or unavailable status never erases a visible
+    /// action; the mutating CLI remains the final fail-closed authority.
+    func refreshCommunityUndoStatus() async {
+        guard DistributionProfile.isCommunity else { return }
+        let output = await runPlaudOutput(
+            args: ["classify-undo-status", "--json"],
+            showError: false
+        )
+        guard let availability = Self.communityUndoAvailability(
+            from: output.trimmingCharacters(in: .whitespacesAndNewlines)
+        ) else { return }
+        switch availability.status {
+        case "none":
+            dismissClassifyUndo()
+        case "undo_available":
+            lastClassifyApply = (count: availability.count, at: Date())
+            classifyUndoNeedsRetry = false
+            classifyApplyRecoveryRequired = false
+        case "apply_recovery_required":
+            lastClassifyApply = (count: availability.count, at: Date())
+            classifyUndoNeedsRetry = true
+            classifyApplyRecoveryRequired = true
+        default:
+            break
+        }
+    }
+
+    /// Run a DRY-RUN classification and
     /// publish the decoded plans into `classifyPlans` to open the preview
     /// sheet. The App's unique capability — the web client cannot do this.
     /// Nothing is moved here; the user reviews + confirms in the sheet.
     func classifyPreview() async {
         guard !classifyRunning else { return }
+        if DistributionProfile.isCommunity, classifyApplyRecoveryRequired {
+            classifyResult =
+                "중단된 폴더 적용을 먼저 안정화하세요. 되돌리기 배너의 ‘상태 안정화’를 누르세요."
+            return
+        }
         classifyRunning = true
         defer { classifyRunning = false }
-        let output = await runPlaudOutput(args: ["classify", "--json"])
+        dismissClassifyPreview()
+        lastCommandError = nil
+        let command = DistributionProfile.isCommunity ? "auto-folder" : "classify"
+        var args = [command, "--json"]
+        if DistributionProfile.isCommunity {
+            args += ["--limit", "200", "--min-confidence", "0.6"]
+            let config = Database.shared.loadAppConfig()
+            let provider = config.classifyModel
+            let backend = Self.normalizedCommunityBackend(
+                provider: provider,
+                storedBackend: config.backends[provider]
+            )
+            let labels = [
+                "claude": "Anthropic / Claude",
+                "codex": "OpenAI / Codex",
+                "gemini": "Google / Gemini",
+                "grok": "xAI / Grok",
+            ]
+            let alert = NSAlert()
+            alert.messageText = "How should this folder preview run?"
+            alert.informativeText =
+                "Use \(labels[provider] ?? provider) (\(backend)) to arbitrate weak matches? "
+                + "This may send your existing folder names plus cached recording titles, "
+                + "keywords, summaries, and transcripts to that provider. Local-only mode "
+                + "uses no external AI. At most 20 provider requests run per preview, and "
+                + "nothing moves until you approve preview rows."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Use selected AI")
+            alert.addButton(withTitle: "Local only")
+            alert.addButton(withTitle: "Cancel")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                args += [
+                    "--llm", "--provider", provider, "--backend", backend,
+                    "--confirm-external",
+                ]
+            case .alertSecondButtonReturn:
+                break
+            default:
+                return
+            }
+        }
+        let output = await runPlaudOutput(args: args)
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let data = trimmed.data(using: .utf8), !data.isEmpty,
               let plans = try? JSONDecoder().decode([ClassifyPlan].self, from: data)
@@ -870,9 +1356,19 @@ final class FileStore: ObservableObject {
             }
             return
         }
+        if DistributionProfile.isCommunity {
+            guard let planID = Self.validatedCommunityPlanID(in: plans) else {
+                classifyResult = plans.isEmpty
+                    ? "No recordings matched a folder."
+                    : "The saved folder preview identifier is missing or inconsistent. Run preview again."
+                return
+            }
+            classifyPlanID = planID
+        }
         // Only files that resolved to a folder are actionable proposals.
         let actionable = plans.filter { !$0.folderName.isEmpty }
         if actionable.isEmpty {
+            classifyPlanID = nil
             classifyResult = "No recordings matched a folder."
             return
         }
@@ -882,36 +1378,109 @@ final class FileStore: ObservableObject {
     /// Apply classification for ONLY the given file ids (`classify --apply`
     /// with one `--only <id>` each), then sync + reload. Sets
     /// `lastClassifyApply` so the UI can offer an Undo banner.
-    func applyClassify(fileIDs: [String]) async {
+    func applyClassify(fileIDs: [String], planID: String? = nil) async {
         guard !classifyRunning, !fileIDs.isEmpty else { return }
         classifyRunning = true
         defer { classifyRunning = false }
-        let args = ["classify", "--apply"] + fileIDs.flatMap { ["--only", $0] }
-        let output = await runPlaudOutput(args: args)
-        await sync(showError: false)
-        // The JSON array has `moved_to` set for files that were actually moved.
-        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        var moved = fileIDs.count
-        if let data = trimmed.data(using: .utf8), !data.isEmpty,
-           let results = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-            let movedCount = results.filter {
-                let to = ($0["moved_to"] as? String) ?? ""
-                return !to.isEmpty
-            }.count
-            if movedCount > 0 { moved = movedCount }
+        let command = DistributionProfile.isCommunity ? "auto-folder" : "classify"
+        let args: [String]
+        if DistributionProfile.isCommunity {
+            guard let planID,
+                  let communityArgs = Self.communityApplyArguments(
+                      fileIDs: fileIDs,
+                      planID: planID
+                  )
+            else {
+                classifyResult = "The folder preview identifier is invalid. Run preview again."
+                return
+            }
+            args = communityArgs
+        } else {
+            args = [command, "--apply", "--json"]
+                + fileIDs.flatMap { ["--only", $0] }
         }
-        lastClassifyApply = (count: moved, at: Date())
+        lastCommandError = nil
+        let output = await runPlaudOutput(args: args)
+        if DistributionProfile.isCommunity {
+            // A failed/ambiguous apply may have created a durable recovery WAL
+            // even when no result rows can be decoded. Restore that action now
+            // instead of waiting for the next app activation.
+            await refreshCommunityUndoStatus()
+        }
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = trimmed.data(using: .utf8), !data.isEmpty,
+              let results = try? JSONDecoder().decode([ClassifyPlan].self, from: data)
+        else {
+            if lastCommandError == nil {
+                classifyResult = "Folder move finished, but its result could not be verified."
+            }
+            return
+        }
+
+        let moved: Int
+        if DistributionProfile.isCommunity {
+            guard let planID,
+                  let summary = Self.communityApplySummary(
+                      selectedFileIDs: fileIDs,
+                      expectedPlanID: planID,
+                      results: results
+                  )
+            else {
+                classifyResult = "Folder move returned an inconsistent result. Sync before retrying."
+                return
+            }
+            moved = summary.movedCount
+            classifyResult = summary.message
+        } else {
+            moved = results.filter { $0.applied || !$0.movedTo.isEmpty }.count
+        }
+        if moved > 0 {
+            await sync(showError: false)
+            lastClassifyApply = (count: moved, at: Date())
+            classifyUndoNeedsRetry = false
+            classifyApplyRecoveryRequired = false
+        } else if lastCommandError == nil && classifyResult == nil {
+            classifyResult = "Folder move finished, but its result could not be verified."
+        }
     }
 
-    /// Revert the last applied classification (`classify-undo --json`), then
-    /// sync + reload and clear the undo banner.
+    /// Revert the last applied classification and retain the retry affordance
+    /// whenever the CLI reports a partial or preflight failure.
     func classifyUndo() async {
         guard !classifyRunning else { return }
         classifyRunning = true
         defer { classifyRunning = false }
-        _ = await runPlaudOutput(args: ["classify-undo", "--json"])
-        lastClassifyApply = nil
-        await sync(showError: false)
+        lastCommandError = nil
+        let currentCount = lastClassifyApply?.count ?? 0
+        let output = await runPlaudOutput(args: ["classify-undo", "--json"])
+        await refreshCommunityUndoStatus()
+        guard let summary = Self.communityUndoSummary(
+            from: output.trimmingCharacters(in: .whitespacesAndNewlines),
+            currentCount: currentCount
+        ) else {
+            if lastClassifyApply != nil {
+                classifyUndoNeedsRetry = true
+            }
+            if lastCommandError == nil {
+                classifyResult = "되돌리기 결과를 확인할 수 없습니다. 재시도 항목은 유지됩니다."
+            }
+            return
+        }
+
+        // A valid structured error is more useful than the generic nonzero-exit
+        // alert produced by the process wrapper.
+        lastCommandError = nil
+        classifyResult = summary.message
+        if summary.completed {
+            dismissClassifyUndo()
+        } else {
+            lastClassifyApply = (count: summary.retryCount, at: Date())
+            classifyUndoNeedsRetry = true
+        }
+        if summary.revertedCount > 0 {
+            await sync(showError: false)
+        }
+        await refreshCommunityUndoStatus()
     }
 
     /// Background backfill of transcript/summary cache for every file.
@@ -1246,21 +1815,80 @@ final class FileStore: ObservableObject {
     @Published var transcribingIDs: Set<String> = []
     @Published var audioURL: URL?
 
+    nonisolated static func reserveTranscription(
+        _ fileID: String,
+        in activeFileIDs: inout Set<String>
+    ) -> Bool {
+        activeFileIDs.insert(fileID).inserted
+    }
+
     func reloadCmdsTranscript() {
         cmdsTranscript = selectedID.flatMap { Database.shared.cmdsTranscript(for: $0) }
     }
 
     func transcribeWithElevenLabs(_ fileID: String, numSpeakers: Int = 0) async {
-        transcribingIDs.insert(fileID)
+        guard Self.reserveTranscription(fileID, in: &transcribingIDs) else { return }
         defer { transcribingIDs.remove(fileID) }
-        var args = ["cmds-transcribe", fileID]
-        if numSpeakers > 0 {
+        let replacingExisting = Database.shared.cmdsTranscriptExists(for: fileID)
+        var retryOutcomeUnknown = false
+        if DistributionProfile.isCommunity {
+            let statusOutput = await runPlaudOutput(
+                args: ["elevenlabs-attempt-status", fileID, "--json"],
+                showError: false
+            )
+            guard let retryState = Self.communityElevenLabsRetryState(
+                from: statusOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+            ) else {
+                lastCommandError =
+                    "이전 ElevenLabs 업로드 상태를 안전하게 확인하지 못했습니다. 오디오는 전송하지 않았습니다."
+                return
+            }
+            retryOutcomeUnknown = retryState == .outcomeUnknown
+            let alert = NSAlert()
+            if retryOutcomeUnknown {
+                alert.messageText = "이전 ElevenLabs 업로드 결과를 확인할 수 없습니다"
+                alert.informativeText =
+                    "이전 요청이 ElevenLabs에 도달했을 수 있습니다. 다시 업로드하면 같은 오디오가 "
+                    + "두 번 처리되어 비용이 중복 청구될 수 있습니다. 이 위험을 이해한 경우에만 "
+                    + "명시적으로 재시도하세요. 결과는 이 앱에 로컬로 저장됩니다."
+            } else {
+                alert.messageText = replacingExisting
+                    ? "Upload and replace the ElevenLabs transcript?"
+                    : "Upload this recording to ElevenLabs?"
+                alert.informativeText =
+                    "ElevenLabs transcription sends this recording's audio to ElevenLabs "
+                    + "and may use paid credits. "
+                    + (replacingExisting ? "This uploads and bills again. " : "")
+                    + "The local result stays in this app."
+            }
+            alert.alertStyle = .warning
+            alert.addButton(
+                withTitle: retryOutcomeUnknown
+                    ? "위험을 이해하고 다시 업로드"
+                    : "Upload and transcribe"
+            )
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        var args = DistributionProfile.isCommunity
+            ? Self.communityElevenLabsArguments(
+                fileID: fileID,
+                numSpeakers: numSpeakers,
+                replacingExisting: replacingExisting,
+                retryOutcomeUnknown: retryOutcomeUnknown
+            )
+            : ["cmds-transcribe", fileID]
+        if !DistributionProfile.isCommunity, numSpeakers > 0 {
             args += ["--num-speakers", String(numSpeakers)]
         }
-        await runPlaud(args: args)
+        _ = await runPlaudOutput(args: args)
         reloadCmdsTranscript()
-        // Transcription spends ElevenLabs credits — update the indicator.
-        await refreshElevenLabs(force: true)
+        reload()
+        // The private edition retains its passive credit indicator; Community
+        // only contacts ElevenLabs for an explicitly confirmed transcription.
+        if !DistributionProfile.isCommunity {
+            await refreshElevenLabs(force: true)
+        }
     }
 
     func relabelCmdsSpeakers(_ fileID: String, mapping: [String: String],
@@ -1379,6 +2007,96 @@ final class FileStore: ObservableObject {
         await runPlaud(args: ["config-classify", model])
     }
 
+    private struct SecretStatusPayload: Decodable {
+        let configured: Bool?
+        let status: String?
+    }
+
+    /// Query only whether a provider key exists. The CLI never returns the
+    /// secret itself, and each provider has its own OS-protected entry.
+    func providerKeyConfigured(_ provider: String) async -> Bool? {
+        let output = await runPlaudOutput(
+            args: ["provider-key-status", secretProviderName(provider), "--json"],
+            showError: false
+        )
+        guard let data = output.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(SecretStatusPayload.self, from: data)
+        else { return nil }
+        return payload.configured
+    }
+
+    @discardableResult
+    func saveProviderKey(_ provider: String, value: String) async -> Bool {
+        let key = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            lastCommandError = "Enter an API key before saving."
+            return false
+        }
+        lastCommandError = nil
+        let output = await runPlaudOutput(
+            args: ["provider-key-set", secretProviderName(provider)],
+            stdin: key + "\n",
+            timeout: 20
+        )
+        return commandReportedSuccess(output)
+    }
+
+    @discardableResult
+    func deleteProviderKey(_ provider: String) async -> Bool {
+        lastCommandError = nil
+        let output = await runPlaudOutput(
+            args: ["provider-key-delete", secretProviderName(provider)], timeout: 20
+        )
+        return commandReportedSuccess(output)
+    }
+
+    func elevenLabsKeyConfigured() async -> Bool? {
+        let output = await runPlaudOutput(
+            args: ["provider-key-status", "elevenlabs", "--json"], showError: false
+        )
+        guard let data = output.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(SecretStatusPayload.self, from: data)
+        else { return nil }
+        return payload.configured
+    }
+
+    @discardableResult
+    func saveElevenLabsKey(_ value: String) async -> Bool {
+        let key = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            lastCommandError = "Enter an ElevenLabs API key before saving."
+            return false
+        }
+        lastCommandError = nil
+        let output = await runPlaudOutput(
+            args: ["provider-key-set", "elevenlabs"],
+            stdin: key + "\n",
+            timeout: 20
+        )
+        return commandReportedSuccess(output)
+    }
+
+    @discardableResult
+    func deleteElevenLabsKey() async -> Bool {
+        lastCommandError = nil
+        let output = await runPlaudOutput(
+            args: ["provider-key-delete", "elevenlabs"], timeout: 20
+        )
+        return commandReportedSuccess(output)
+    }
+
+    private func commandReportedSuccess(_ output: String) -> Bool {
+        guard let data = output.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(SecretStatusPayload.self, from: data)
+        else { return lastCommandError == nil && !output.isEmpty }
+        return payload.status.map { ["ok", "saved", "deleted"].contains($0) }
+            ?? (payload.configured != nil)
+    }
+
+    private func secretProviderName(_ provider: String) -> String {
+        ["claude": "anthropic", "codex": "openai"][provider] ?? provider
+    }
+
     /// Set the default metadata-generate model (codex = GPT via the Codex CLI
     /// subscription login). Same CLI-routed write as setClassifyModel.
     func setMetadataModel(_ model: String) async {
@@ -1407,12 +2125,330 @@ final class FileStore: ObservableObject {
         audioURL = url
     }
 
-    /// Shell out to `uv run plaud …` and return stdout.
-    ///
-    /// `timeout` (seconds) is an optional watchdog: when set, the process is
-    /// terminated if it overruns. When `nil` (the default), behavior is
-    /// unchanged — it waits indefinitely via `waitUntilExit()`, matching every
-    /// existing caller.
+    nonisolated private static func posixError(_ code: Int32) -> NSError {
+        NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+    }
+
+    nonisolated private static func requirePOSIXSuccess(_ code: Int32) throws {
+        if code != 0 { throw posixError(code) }
+    }
+
+    nonisolated private static func withCStringArray<Result>(
+        _ strings: [String],
+        body: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) throws -> Result
+    ) throws -> Result {
+        guard strings.allSatisfy({ !$0.utf8.contains(0) }) else {
+            throw posixError(EINVAL)
+        }
+        var pointers: [UnsafeMutablePointer<CChar>?] = []
+        defer { pointers.compactMap { $0 }.forEach { free($0) } }
+        for string in strings {
+            guard let pointer = strdup(string) else { throw posixError(ENOMEM) }
+            pointers.append(pointer)
+        }
+        pointers.append(nil)
+        return try pointers.withUnsafeMutableBufferPointer { buffer in
+            guard let baseAddress = buffer.baseAddress else { throw posixError(ENOMEM) }
+            return try body(baseAddress)
+        }
+    }
+
+    /// Spawn the configured executable as leader of a new process group. A
+    /// timeout can therefore terminate provider helpers that inherited its
+    /// stdout/stderr pipes, not just the immediate Python/uv child.
+    nonisolated private static func spawnOwnedProcessGroup(
+        _ process: Process,
+        stdout: Pipe,
+        stderr: Pipe,
+        input: Pipe?
+    ) throws -> pid_t {
+        guard let executable = process.executableURL?.path, !executable.isEmpty else {
+            throw posixError(EINVAL)
+        }
+
+        var actions: posix_spawn_file_actions_t?
+        try requirePOSIXSuccess(posix_spawn_file_actions_init(&actions))
+        defer { posix_spawn_file_actions_destroy(&actions) }
+
+        let stdoutRead = stdout.fileHandleForReading.fileDescriptor
+        let stdoutWrite = stdout.fileHandleForWriting.fileDescriptor
+        let stderrRead = stderr.fileHandleForReading.fileDescriptor
+        let stderrWrite = stderr.fileHandleForWriting.fileDescriptor
+        let nullInput: Int32?
+        let inputRead: Int32
+        if let input {
+            nullInput = nil
+            inputRead = input.fileHandleForReading.fileDescriptor
+        } else {
+            let descriptor = Darwin.open("/dev/null", O_RDONLY | O_CLOEXEC)
+            if descriptor == -1 { throw posixError(errno) }
+            nullInput = descriptor
+            inputRead = descriptor
+        }
+        defer {
+            if let nullInput { _ = Darwin.close(nullInput) }
+        }
+        let inputWrite = input?.fileHandleForWriting.fileDescriptor
+
+        // Duplicate every mapping source above the standard-descriptor range.
+        // If the parent was launched with fd 0/1/2 closed, Pipe may reuse those
+        // numbers; direct dup2/addclose actions would then overwrite or close a
+        // different standard stream depending on action order.
+        var safeSources: [Int32] = []
+        defer { safeSources.forEach { _ = Darwin.close($0) } }
+        for descriptor in [inputRead, stdoutWrite, stderrWrite] {
+            let duplicate = Darwin.fcntl(descriptor, F_DUPFD_CLOEXEC, STDERR_FILENO + 1)
+            if duplicate == -1 { throw posixError(errno) }
+            safeSources.append(duplicate)
+        }
+        // CLOEXEC_DEFAULT is applied before the ordered file actions.  Mark
+        // the temporary dup2 sources as explicit inheritance inputs so they
+        // still exist when the dup2 actions run; the close actions below then
+        // remove the temporary descriptors from the final child image.
+        for descriptor in safeSources {
+            try requirePOSIXSuccess(
+                posix_spawn_file_actions_addinherit_np(&actions, descriptor)
+            )
+        }
+        try requirePOSIXSuccess(
+            posix_spawn_file_actions_adddup2(&actions, safeSources[0], STDIN_FILENO)
+        )
+        try requirePOSIXSuccess(
+            posix_spawn_file_actions_adddup2(&actions, safeSources[1], STDOUT_FILENO)
+        )
+        try requirePOSIXSuccess(
+            posix_spawn_file_actions_adddup2(&actions, safeSources[2], STDERR_FILENO)
+        )
+
+        let originalDescriptors = Set(
+            [stdoutRead, stdoutWrite, stderrRead, stderrWrite, inputRead, inputWrite]
+                .compactMap { $0 }
+        )
+        for descriptor in originalDescriptors where descriptor > STDERR_FILENO {
+            try requirePOSIXSuccess(posix_spawn_file_actions_addclose(&actions, descriptor))
+        }
+        for descriptor in safeSources {
+            try requirePOSIXSuccess(posix_spawn_file_actions_addclose(&actions, descriptor))
+        }
+        if let directory = process.currentDirectoryURL {
+            let status = directory.path.withCString { path in
+                if #available(macOS 26.0, *) {
+                    posix_spawn_file_actions_addchdir(&actions, path)
+                } else {
+                    posix_spawn_file_actions_addchdir_np(&actions, path)
+                }
+            }
+            try requirePOSIXSuccess(status)
+        }
+
+        var attributes: posix_spawnattr_t?
+        try requirePOSIXSuccess(posix_spawnattr_init(&attributes))
+        defer { posix_spawnattr_destroy(&attributes) }
+        // Close every descriptor except mappings explicitly installed by the
+        // file actions above. The app may hold SQLite, audio, or credential
+        // descriptors that must never leak into a provider CLI.
+        let flags = Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)
+        try requirePOSIXSuccess(posix_spawnattr_setflags(&attributes, flags))
+        // A zero pgroup makes the spawned pid the new group id.
+        try requirePOSIXSuccess(posix_spawnattr_setpgroup(&attributes, 0))
+
+        let arguments = [executable] + (process.arguments ?? [])
+        let environment = (process.environment ?? ProcessInfo.processInfo.environment)
+            .map { "\($0.key)=\($0.value)" }
+            .sorted()
+        var childPID: pid_t = 0
+        let spawnStatus = try executable.withCString { executablePointer in
+            try withCStringArray(arguments) { argumentPointers in
+                try withCStringArray(environment) { environmentPointers in
+                    posix_spawn(
+                        &childPID,
+                        executablePointer,
+                        &actions,
+                        &attributes,
+                        argumentPointers,
+                        environmentPointers
+                    )
+                }
+            }
+        }
+        try requirePOSIXSuccess(spawnStatus)
+        return childPID
+    }
+
+    nonisolated private static func waitForChild(_ pid: pid_t) throws -> Int32 {
+        var status: Int32 = 0
+        while true {
+            let result = Darwin.waitpid(pid, &status, 0)
+            if result == pid { return status }
+            if result == -1, errno == EINTR { continue }
+            throw posixError(errno)
+        }
+    }
+
+    nonisolated private static func exitCode(fromWaitStatus status: Int32) -> Int32 {
+        let signal = status & 0x7f
+        return signal == 0 ? (status >> 8) & 0xff : signal
+    }
+
+    nonisolated private static func ownedProcessGroupExists(_ processGroup: pid_t) -> Bool {
+        if Darwin.kill(-processGroup, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    /// Terminate only the process group created by `spawnOwnedProcessGroup`.
+    /// The zero-signal probe avoids sending a later signal once that group no
+    /// longer exists; while descendants remain, the group id remains owned by
+    /// this invocation even after its leader has exited.
+    nonisolated private static func terminateOwnedProcessGroup(
+        _ processGroup: pid_t,
+        grace: TimeInterval,
+        timeoutState: ProcessTimeoutState
+    ) {
+        guard ownedProcessGroupExists(processGroup) else { return }
+        _ = Darwin.kill(-processGroup, SIGTERM)
+        if grace > 0 {
+            Thread.sleep(forTimeInterval: grace)
+        }
+        guard ownedProcessGroupExists(processGroup) else { return }
+        if Darwin.kill(-processGroup, SIGKILL) == 0 {
+            timeoutState.markForceKilled()
+        }
+    }
+
+    /// Run a configured process while draining stdout and stderr concurrently.
+    /// Reading only after child exit can deadlock once either pipe fills. The
+    /// process group and bounded drain fallback also prevent descendants from
+    /// holding the app open after a timeout.
+    nonisolated static func executeAndCapture(
+        _ process: Process,
+        stdin: String? = nil,
+        timeout: TimeInterval? = nil,
+        terminationGrace: TimeInterval = 0.5,
+        drainGrace: TimeInterval = 1.0
+    ) throws -> CommandResult {
+        let boundedTerminationGrace = min(max(terminationGrace, 0), 2)
+        let boundedDrainGrace = min(max(drainGrace, 0), 2)
+        let stdout = Pipe()
+        let stderr = Pipe()
+        let input = stdin.map { _ in Pipe() }
+        let childPID: pid_t
+        do {
+            childPID = try spawnOwnedProcessGroup(
+                process,
+                stdout: stdout,
+                stderr: stderr,
+                input: input
+            )
+        } catch {
+            try? stdout.fileHandleForReading.close()
+            try? stdout.fileHandleForWriting.close()
+            try? stderr.fileHandleForReading.close()
+            try? stderr.fileHandleForWriting.close()
+            try? input?.fileHandleForReading.close()
+            try? input?.fileHandleForWriting.close()
+            throw error
+        }
+
+        let stdoutCapture = ProcessCaptureBuffer()
+        let stderrCapture = ProcessCaptureBuffer()
+        let drainGroup = DispatchGroup()
+        drainGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { drainGroup.leave() }
+            stdoutCapture.replace(with: stdout.fileHandleForReading.readDataToEndOfFile())
+        }
+        drainGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { drainGroup.leave() }
+            stderrCapture.replace(with: stderr.fileHandleForReading.readDataToEndOfFile())
+        }
+        try? stdout.fileHandleForWriting.close()
+        try? stderr.fileHandleForWriting.close()
+        try? input?.fileHandleForReading.close()
+
+        let timeoutState = ProcessTimeoutState()
+        let timeoutCompletion = DispatchSemaphore(value: 0)
+        let watchdog: DispatchWorkItem?
+        if let timeout {
+            let work = DispatchWorkItem {
+                defer { timeoutCompletion.signal() }
+                guard timeoutState.beginTimeout() else { return }
+                terminateOwnedProcessGroup(
+                    childPID,
+                    grace: boundedTerminationGrace,
+                    timeoutState: timeoutState
+                )
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: work)
+            watchdog = work
+        } else {
+            watchdog = nil
+        }
+
+        var inputError: Error?
+        if let stdin, let input {
+            do {
+                try input.fileHandleForWriting.write(contentsOf: Data(stdin.utf8))
+            } catch {
+                inputError = error
+                _ = Darwin.kill(-childPID, SIGKILL)
+            }
+            try? input.fileHandleForWriting.close()
+        }
+
+        let waitStatus = try waitForChild(childPID)
+        timeoutState.markCompleted()
+        watchdog?.cancel()
+        if timeoutState.timedOut {
+            _ = timeoutCompletion.wait(
+                timeout: .now() + boundedTerminationGrace + 0.25
+            )
+        }
+        let drainTimedOut = drainGroup.wait(timeout: .now() + boundedDrainGrace) == .timedOut
+        if drainTimedOut {
+            // A successful leader can still daemonize a descendant that keeps
+            // these pipes open. Clean the group synchronously while it is
+            // still attributable to this invocation, then fail closed instead
+            // of accepting truncated output as a successful command.
+            terminateOwnedProcessGroup(
+                childPID,
+                grace: boundedTerminationGrace,
+                timeoutState: timeoutState
+            )
+            try? stdout.fileHandleForReading.close()
+            try? stderr.fileHandleForReading.close()
+            _ = drainGroup.wait(timeout: .now() + 0.25)
+        }
+        let outData = stdoutCapture.snapshot()
+        let errData = stderrCapture.snapshot()
+        if timeoutState.timedOut {
+            return CommandResult(
+                exitCode: -1,
+                stdout: String(data: outData, encoding: .utf8) ?? "",
+                stderr: "plaud command timed out after \(Int(timeout ?? 0))s",
+                forceKilled: timeoutState.forceKilled
+            )
+        }
+        if drainTimedOut {
+            return CommandResult(
+                exitCode: -1,
+                stdout: String(data: outData, encoding: .utf8) ?? "",
+                stderr: "plaud command left a helper process running",
+                forceKilled: timeoutState.forceKilled
+            )
+        }
+        if let inputError {
+            throw inputError
+        }
+        return CommandResult(
+            exitCode: exitCode(fromWaitStatus: waitStatus),
+            stdout: String(data: outData, encoding: .utf8) ?? "",
+            stderr: String(data: errData, encoding: .utf8) ?? ""
+        )
+    }
+
+    /// Shell out to `uv run plaud …` and return stdout. `stdin` is streamed
+    /// through an anonymous pipe and is never added to argv or a temporary file.
     func runPlaudOutput(
         args: [String],
         stdin: String? = nil,
@@ -1420,59 +2456,9 @@ final class FileStore: ObservableObject {
         showError: Bool = true
     ) async -> String {
         let result = await Task.detached(priority: .userInitiated) { () -> CommandResult in
-            let stdout = Pipe()
-            let stderr = Pipe()
-            let input = stdin.map { _ in Pipe() }
             do {
                 let process = try RuntimePaths.makePlaudProcess(args: args)
-                process.standardOutput = stdout
-                process.standardError = stderr
-                if let input {
-                    process.standardInput = input
-                }
-                try process.run()
-                if let stdin,
-                   let input,
-                   let data = stdin.data(using: .utf8) {
-                    input.fileHandleForWriting.write(data)
-                    input.fileHandleForWriting.closeFile()
-                }
-
-                var timedOut = false
-                if let timeout {
-                    // Arm a watchdog that kills the process if it overruns, then
-                    // wait. Reading the pipes *after* the process exits (or is
-                    // killed) avoids a deadlock on a full pipe buffer for these
-                    // small-output commands.
-                    let watchdog = DispatchWorkItem {
-                        if process.isRunning {
-                            timedOut = true
-                            process.terminate()
-                        }
-                    }
-                    DispatchQueue.global().asyncAfter(
-                        deadline: .now() + timeout, execute: watchdog
-                    )
-                    process.waitUntilExit()
-                    watchdog.cancel()
-                } else {
-                    process.waitUntilExit()
-                }
-
-                let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-                let errData = stderr.fileHandleForReading.readDataToEndOfFile()
-                if timedOut {
-                    return CommandResult(
-                        exitCode: -1,
-                        stdout: String(data: outData, encoding: .utf8) ?? "",
-                        stderr: "plaud command timed out after \(Int(timeout ?? 0))s"
-                    )
-                }
-                return CommandResult(
-                    exitCode: process.terminationStatus,
-                    stdout: String(data: outData, encoding: .utf8) ?? "",
-                    stderr: String(data: errData, encoding: .utf8) ?? ""
-                )
+                return try Self.executeAndCapture(process, stdin: stdin, timeout: timeout)
             } catch {
                 return CommandResult(
                     exitCode: -1,
@@ -1579,21 +2565,9 @@ final class FileStore: ObservableObject {
     @discardableResult
     private func runPlaud(args: [String], showError: Bool = true) async -> Bool {
         let result = await Task.detached(priority: .userInitiated) { () -> CommandResult in
-            let stdout = Pipe()
-            let stderr = Pipe()
             do {
                 let process = try RuntimePaths.makePlaudProcess(args: args)
-                process.standardOutput = stdout
-                process.standardError = stderr
-                try process.run()
-                process.waitUntilExit()
-                let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-                let errData = stderr.fileHandleForReading.readDataToEndOfFile()
-                return CommandResult(
-                    exitCode: process.terminationStatus,
-                    stdout: String(data: outData, encoding: .utf8) ?? "",
-                    stderr: String(data: errData, encoding: .utf8) ?? ""
-                )
+                return try Self.executeAndCapture(process)
             } catch {
                 return CommandResult(
                     exitCode: -1,

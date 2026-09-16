@@ -73,3 +73,37 @@ def test_classify_model_config_roundtrip(tmp_path: Path, monkeypatch: pytest.Mon
     assert app_config.classify_model() == "grok"
     # Other keys keep their defaults after the partial write.
     assert app_config.backend_for("claude") == "cli"
+    assert app_config.folder_llm_threshold() == 0.8
+    app_config.set_folder_llm_threshold(0.72)
+    assert app_config.folder_llm_threshold() == 0.72
+
+
+def test_folder_llm_threshold_rejects_out_of_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_config, "CONFIG_FILE", tmp_path / "config.json")
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        app_config.set_folder_llm_threshold(1.1)
+
+
+def test_routing_settings_are_written_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_config, "CONFIG_FILE", tmp_path / "config.json")
+    real_save = app_config.save
+    saves: list[dict] = []
+
+    def record_save(config: dict) -> None:
+        saves.append(config)
+        real_save(config)
+
+    monkeypatch.setattr(app_config, "save", record_save)
+
+    app_config.set_routing_settings("codex", "api", "gpt-routing-test")
+
+    assert len(saves) == 1
+    saved = app_config.load()
+    assert saved["classify_model"] == "codex"
+    assert saved["backends"]["codex"] == "api"
+    assert saved["models"]["codex"] == "gpt-routing-test"
+    assert list(tmp_path.glob(".config.json.tmp-*")) == []

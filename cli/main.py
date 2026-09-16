@@ -21,18 +21,21 @@ from rich.table import Table
 
 from core import PlaudClient, app_config, load_config
 from core.client import PlaudAPIError
+from core.community_models import (
+    PROVIDER_LABELS,
+    ModelUnavailable,
+    validate_route,
+)
 from core.config import ConfigError
 from core.distribution import COMMUNITY_EDITION
 from core.storage import DEFAULT_DB, Storage
 from core.tags import normalize_tags
 
-# Private-edition AI/classification modules are intentionally absent from this
-# source tree. Their command wrappers remain guarded below only so an old UI or
-# script receives a clear "unavailable" response instead of executing an
-# external provider.
+# Private-edition taxonomy modules are intentionally absent from this source
+# tree. Community routing uses only folders fetched from the current user's
+# Plaud workspace.
 FOLDER_TAXONOMY: tuple[Any, ...] = ()
-PROVIDER_LABELS: tuple[str, ...] = ()
-MODEL_HELP = "external models are unavailable in the Community edition"
+MODEL_HELP = "provider: " + " | ".join(PROVIDER_LABELS)
 
 
 def classify_snapshot(*_args: Any, **_kwargs: Any) -> None:
@@ -63,6 +66,9 @@ COMMUNITY_ALLOWED_COMMANDS = frozenset(
         "folder-rename",
         "folder-delete",
         "move",
+        "auto-folder",
+        "classify-undo",
+        "classify-undo-status",
         "rename",
         "detail",
         "transcript",
@@ -89,12 +95,21 @@ COMMUNITY_ALLOWED_COMMANDS = frozenset(
         "export",
         "audio-url",
         "web",
+        "provider-key-set",
+        "provider-key-status",
+        "provider-key-delete",
+        "elevenlabs-attempt-status",
+        "elevenlabs-transcribe",
         "server-speakers",
         "speaker-rename-server",
         "plaud-relabel",
         "note-edit",
         "star",
         "config",
+        "config-classify",
+        "config-backend",
+        "config-model",
+        "config-folder-threshold",
         "config-path",
         "contents",
         "paths",
@@ -566,6 +581,151 @@ def move(file_id: str, folder_id: str = typer.Argument(None)) -> None:
     storage = Storage()
     storage.set_file_folders(file_id, folder_ids)
     console.print(f"[green]moved[/green] {file_id} -> {folder_id or '(Unfiled)'}")
+
+
+@safe_command(name="auto-folder")
+def auto_folder(
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Apply selected preview rows. Without this flag Cloud is never mutated.",
+    ),
+    only: list[str] = typer.Option(
+        None,
+        "--only",
+        help="Explicit file id to apply/preview (repeatable; required with --apply).",
+    ),
+    plan_id: str = typer.Option(
+        "",
+        "--plan-id",
+        help="Exact plan id returned by the reviewed preview; required with --apply.",
+    ),
+    include_filed: bool = typer.Option(
+        False,
+        "--include-filed",
+        help="Also preview recordings already assigned to a folder.",
+    ),
+    limit: int = typer.Option(0, "--limit", min=0, help="Maximum rows; 0 means all."),
+    min_confidence: float = typer.Option(
+        0.6,
+        "--min-confidence",
+        min=0.0,
+        max=1.0,
+        help="Selected rows below this local/model score are not applied.",
+    ),
+    llm: bool = typer.Option(
+        False,
+        "--llm",
+        help="Allow the explicitly selected external model to arbitrate weak local matches.",
+    ),
+    provider: str = typer.Option(
+        "",
+        "--provider",
+        help=MODEL_HELP + ". Required with --llm; never inferred as consent.",
+    ),
+    backend: str = typer.Option(
+        "",
+        "--backend",
+        help="cli (vendor app/OAuth) or api (protected API key). Required with --llm.",
+    ),
+    confirm_external: bool = typer.Option(
+        False,
+        "--confirm-external",
+        help=(
+            "Confirm this preview may send folder names plus recording title, keywords, "
+            "summary, and transcript to the selected provider."
+        ),
+    ),
+    max_ai_requests: int = typer.Option(
+        20,
+        "--max-ai-requests",
+        min=0,
+        max=50,
+        help="Per-preview external model request cap (0 disables arbitration calls).",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit preview rows as a JSON array."),
+) -> None:
+    """Preview automatic routes into existing Plaud folders; apply selected rows only."""
+    from core.community_router import (
+        PreviewPlanError,
+        UndoManifestError,
+        apply_saved_plan,
+        route_recordings,
+        write_preview_plan,
+    )
+    from core.paths import DATA_DIR
+
+    if apply and not only:
+        raise typer.BadParameter("--apply requires at least one --only FILE_ID")
+    if apply and not plan_id:
+        raise typer.BadParameter("--apply requires --plan-id from the reviewed preview")
+    if not apply and plan_id:
+        raise typer.BadParameter("--plan-id is only valid with --apply")
+    if apply and (llm or provider or backend or confirm_external or max_ai_requests != 20):
+        raise typer.BadParameter(
+            "--apply reuses the exact saved preview; model flags belong on the preview command"
+        )
+    if llm:
+        try:
+            provider, backend = validate_route(provider, backend)
+        except ModelUnavailable as exc:
+            raise typer.BadParameter(str(exc)) from exc
+
+    storage = Storage()
+    cfg = load_config()
+    with PlaudClient(cfg) as client:
+        try:
+            if apply:
+                undo_path = DATA_DIR / "last_classify.json"
+                report = apply_saved_plan(
+                    storage,
+                    client,
+                    selected_ids=only or (),
+                    plan_path=DATA_DIR / "auto_folder_preview.json",
+                    expected_plan_id=plan_id,
+                    undo_path=undo_path,
+                    min_confidence=min_confidence,
+                )
+            else:
+                report = route_recordings(
+                    storage,
+                    client,
+                    selected_ids=only,
+                    include_filed=include_filed,
+                    limit=limit or None,
+                    use_llm=llm,
+                    provider=provider,
+                    backend=backend,
+                    confirmed_external=confirm_external,
+                    max_llm_calls=max_ai_requests,
+                )
+                if not report.error:
+                    write_preview_plan(report, DATA_DIR / "auto_folder_preview.json")
+        except (PreviewPlanError, UndoManifestError, ValueError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+
+    if json_out:
+        _emit_json(report.public_rows())
+        return
+    if report.error:
+        console.print(f"[yellow]{report.error}[/yellow]")
+        return
+    if not apply:
+        console.print(f"[dim]plan id: {report.plan_id}[/dim]")
+    for decision in report.decisions:
+        target = decision.folder_name or "(no confident match)"
+        applied = " [green]applied[/green]" if decision.applied else ""
+        error = f" [yellow]{decision.error}[/yellow]" if decision.error else ""
+        console.print(
+            f"{decision.confidence:.2f}  [bold]{target}[/bold]  "
+            f"[dim]{decision.title} · {decision.reason} · {decision.source}[/dim]"
+            f"{applied}{error}"
+        )
+    if apply:
+        console.print(
+            f"[green]moved {report.applied_count}[/green] explicitly selected recording(s) — "
+            "undo with `plaud classify-undo`"
+        )
 
 
 @safe_command(name="folder-doctor")
@@ -1502,38 +1662,74 @@ def prune_empty_cache(
 def classify_undo(
     json_out: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Revert the most recent `classify --apply` — put those files back to Unfiled."""
-    import json as _json
+    """Restore the exact folders saved before the most recent auto-folder apply."""
+    from core.community_router import UndoManifestError, undo_saved_manifest
     from core.paths import DATA_DIR
 
     manifest_path = DATA_DIR / "last_classify.json"
-    if not manifest_path.exists():
-        msg = "no classify run to undo (no manifest found)"
-        if json_out:
-            _emit_json({"status": "nothing", "detail": msg, "reverted": 0})
-        else:
-            console.print(f"[yellow]{msg}[/yellow]")
-        return
-    manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
-    moved = manifest.get("moved", [])
-    cfg = load_config()
     storage = Storage()
-    reverted = 0
-    with PlaudClient(cfg) as client:
-        for entry in moved:
-            fid = entry["file_id"]
-            try:
-                client.set_file_folders(fid, [])  # back to Unfiled
-                storage.set_file_folders(fid, [])
-                storage.update_note_folder(fid, folder_id=None, folder_name=None)
-                reverted += 1
-            except Exception as exc:  # noqa: BLE001 — report, keep going
-                console.print(f"[yellow]skip[/yellow] {fid}: {exc}")
-    manifest_path.unlink(missing_ok=True)
+    try:
+        with PlaudClient(load_config()) as client:
+            report = undo_saved_manifest(storage, client, manifest_path)
+    except UndoManifestError as exc:
+        msg = f"{exc}; no additional Cloud changes were made"
+        if json_out:
+            _emit_json({"status": "error", "detail": msg, "reverted": 0})
+        else:
+            console.print(f"[red]{msg}[/red]")
+        raise typer.Exit(1)
+    except Exception:  # noqa: BLE001 - redact provider diagnostics
+        msg = "could not verify Plaud folders; no additional Cloud changes were made"
+        if json_out:
+            _emit_json({"status": "error", "detail": msg, "reverted": 0})
+        else:
+            console.print(f"[red]{msg}[/red]")
+        raise typer.Exit(1)
+
+    payload = report.public_dict()
     if json_out:
-        _emit_json({"status": "ok", "reverted": reverted})
-    else:
-        console.print(f"[green]reverted {reverted}[/green] files back to Unfiled")
+        _emit_json(payload)
+        return
+    if payload["status"] == "nothing":
+        console.print(f"[yellow]{payload['detail']}[/yellow]")
+        return
+    if payload["status"] == "apply_recovery_required":
+        console.print(f"[yellow]{payload['detail']}[/yellow]")
+        return
+    console.print(
+        f"[green]restored {report.reverted_count}[/green] file(s) to their previous folder"
+    )
+    for failure in report.failures:
+        console.print(f"[yellow]skip[/yellow] {failure['file_id']}: {failure['error']}")
+
+
+@safe_command(name="classify-undo-status")
+def classify_undo_status_command(
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Read local folder undo/recovery availability without network access."""
+    from core.community_router import UndoManifestError, classify_undo_status
+    from core.paths import DATA_DIR
+
+    try:
+        status = classify_undo_status(DATA_DIR / "last_classify.json")
+    except UndoManifestError:
+        payload = {
+            "status": "error",
+            "count": 0,
+            "detail": "folder undo artifacts are invalid or inconsistent",
+        }
+        if json_out:
+            _emit_json(payload)
+        else:
+            console.print(f"[red]{payload['detail']}[/red]")
+        raise typer.Exit(1)
+
+    payload = status.public_dict()
+    if json_out:
+        _emit_json(payload)
+        return
+    console.print(f"{payload['status']}: {payload['count']} · {payload['detail']}")
 
 
 def move_to_named_folder(storage: Storage, file_id: str, folder_name: str) -> str:
@@ -1635,6 +1831,194 @@ def web(
         subprocess.run(["open", url], check=False)
     if copy:
         subprocess.run(["pbcopy"], input=url.encode(), check=False)
+
+
+@safe_command(name="provider-key-set")
+def provider_key_set(provider: str) -> None:
+    """Store a provider API key read only from stdin (never an argv value)."""
+    from core.provider_secrets import set_api_key
+    from core.secret_store import CredentialStoreError
+
+    if sys.stdin.isatty():
+        console.print(
+            "[red]API key required on stdin[/red] — pipe it to this command; "
+            "the key must never be a command-line argument."
+        )
+        raise typer.Exit(2)
+    raw = sys.stdin.read(4098)
+    if len(raw) > 4097:
+        console.print("[red]API key input is too long[/red]")
+        raise typer.Exit(2)
+    try:
+        set_api_key(provider, raw)
+    except (ValueError, CredentialStoreError) as exc:
+        console.print(f"[red]Could not store API key[/red]: {exc}")
+        raise typer.Exit(1) from None
+    console.print(
+        f"[green]{provider.lower()} API key stored[/green] in OS-protected storage; "
+        "no key fragment was printed."
+    )
+
+
+@safe_command(name="provider-key-status")
+def provider_key_status(
+    provider: str,
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Show set/unset only; never reveal a masked key or fingerprint."""
+    from core.provider_secrets import api_key_status
+    from core.secret_store import CredentialStoreError
+
+    try:
+        status_result = api_key_status(provider)
+    except (ValueError, CredentialStoreError) as exc:
+        console.print(f"[red]Could not read API key status[/red]: {exc}")
+        raise typer.Exit(1) from None
+    if json_out:
+        _emit_json(status_result)
+        return
+    console.print(f"{status_result['provider']}: [bold]{status_result['status']}[/bold]")
+
+
+@safe_command(name="provider-key-delete")
+def provider_key_delete(provider: str) -> None:
+    """Remove one provider key without touching Plaud or other providers."""
+    from core.provider_secrets import delete_api_key
+    from core.secret_store import CredentialStoreError
+
+    try:
+        existed = delete_api_key(provider)
+    except (ValueError, CredentialStoreError) as exc:
+        console.print(f"[red]Could not remove API key[/red]: {exc}")
+        raise typer.Exit(1) from None
+    state = "removed" if existed else "already unset"
+    console.print(f"[green]{provider.lower()} API key {state}[/green]")
+
+
+@safe_command(name="elevenlabs-transcribe")
+def elevenlabs_transcribe(
+    file_id: str,
+    confirm_upload: bool = typer.Option(
+        False,
+        "--confirm-upload",
+        help="Required: confirm audio leaves this device and provider usage may incur cost.",
+    ),
+    diarize: bool = typer.Option(True, help="Ask ElevenLabs to identify speakers."),
+    language: str = typer.Option("", help="Optional ISO-639-1/3 hint, e.g. ko or kor."),
+    num_speakers: int = typer.Option(0, help="Expected speakers: 1-32; 0 lets Scribe decide."),
+    force: bool = typer.Option(
+        False,
+        help=(
+            "Re-upload when a local transcript exists or a prior upload outcome is unknown; "
+            "this can bill again."
+        ),
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Upload one recording to ElevenLabs Scribe v2 and save its transcript locally."""
+    from core.secret_store import CredentialStoreError
+    from core.transcribe import (
+        TranscriptionError,
+        transcription_retry_outcome_unknown,
+        transcribe_and_store,
+    )
+
+    if not confirm_upload:
+        console.print(
+            "[red]Upload confirmation required[/red] — this sends the recording audio to "
+            "ElevenLabs and may consume paid credits. Re-run with --confirm-upload."
+        )
+        raise typer.Exit(2)
+
+    storage = Storage()
+    try:
+        retry_outcome_unknown = transcription_retry_outcome_unknown(Path(storage._db_path), file_id)
+    except (AttributeError, TypeError, ValueError):
+        console.print("[red]Could not verify the local ElevenLabs retry state.[/red]")
+        raise typer.Exit(1) from None
+    if retry_outcome_unknown and not force:
+        console.print(
+            "[yellow]A prior ElevenLabs upload outcome is unknown.[/yellow] "
+            "Use --force only after confirming a retry may bill twice."
+        )
+        raise typer.Exit(2)
+    if storage.get_cmds_transcript(file_id) is not None and not force:
+        console.print(
+            "[yellow]A local external transcript already exists.[/yellow] "
+            "Use --force only if you intend to upload and pay again."
+        )
+        raise typer.Exit(2)
+
+    if not json_out:
+        console.print(
+            "[yellow]Uploading audio to ElevenLabs Scribe v2; provider processing and "
+            "account charges may apply.[/yellow]"
+        )
+    try:
+        result = transcribe_and_store(
+            load_config(),
+            file_id,
+            storage=storage,
+            confirm_upload=True,
+            force=force,
+            diarize=diarize,
+            model_id="scribe_v2",
+            language_code=language or None,
+            num_speakers=num_speakers or None,
+        )
+    except (ValueError, CredentialStoreError, TranscriptionError) as exc:
+        console.print(f"[red]ElevenLabs transcription failed[/red]: {exc}")
+        raise typer.Exit(1) from None
+
+    summary = {
+        "file_id": result["file_id"],
+        "provider": result["provider"],
+        "model": result["model"],
+        "language": result.get("language"),
+        "segments": len(result["segments"]),
+        "audio_bytes_uploaded": result["audio_bytes_uploaded"],
+        "stored_locally": True,
+    }
+    if json_out:
+        _emit_json(summary)
+        return
+    console.print(
+        f"[green]saved locally[/green] {summary['segments']} segments · "
+        f"language={summary['language'] or 'auto'}"
+    )
+
+
+@safe_command(name="elevenlabs-attempt-status")
+def elevenlabs_attempt_status(
+    file_id: str,
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Read the local paid-upload retry marker without network access."""
+    from core.transcribe import transcription_retry_outcome_unknown
+
+    storage = Storage()
+    try:
+        outcome_unknown = transcription_retry_outcome_unknown(Path(storage._db_path), file_id)
+    except (AttributeError, TypeError, ValueError):
+        payload = {
+            "status": "error",
+            "retry_may_bill_twice": True,
+            "detail": "could not verify the local ElevenLabs retry state",
+        }
+        if json_out:
+            _emit_json(payload)
+        else:
+            console.print(f"[red]{payload['detail']}[/red]")
+        raise typer.Exit(1) from None
+
+    payload = {
+        "status": "outcome_unknown" if outcome_unknown else "clear",
+        "retry_may_bill_twice": outcome_unknown,
+    }
+    if json_out:
+        _emit_json(payload)
+        return
+    console.print(payload["status"])
 
 
 @safe_command(name="cmds-relabel")
@@ -1908,7 +2292,11 @@ def config_show() -> None:
     console.print("\n[bold]API model ids[/bold] (used when backend=api)")
     for k, v in cfg["models"].items():
         console.print(f"  {k:>8}: {v}")
-    console.print(f"\n[bold]Auto-classify model[/bold]: {app_config.classify_model()}")
+    console.print(f"\n[bold]Auto-folder provider preference[/bold]: {app_config.classify_model()}")
+    console.print(
+        "[bold]External arbitration threshold[/bold]: "
+        f"{app_config.folder_llm_threshold():.2f} (preference only; not consent)"
+    )
     console.print(
         f"[bold]Metadata model[/bold]: {app_config.metadata_model()}"
         f" (backend: {app_config.backend_for(app_config.metadata_model())})"
@@ -1930,13 +2318,13 @@ def config_show() -> None:
 
 @safe_command(name="config-classify")
 def config_classify(model: str) -> None:
-    """Set which model auto-classify / metadata-generate uses by default."""
+    """Set the UI's folder-routing provider preference (not external consent)."""
     valid = ("claude", "codex", "gemini", "grok")
     if model not in valid:
         raise typer.BadParameter(f"model must be one of: {', '.join(valid)}")
     app_config.set_classify_model(model)
     backend = app_config.backend_for(model)
-    console.print(f"[green]ok[/green] classify model -> {model} (backend: {backend})")
+    console.print(f"[green]ok[/green] folder provider -> {model} (backend: {backend})")
 
 
 @safe_command(name="config-metadata-model")
@@ -1950,8 +2338,10 @@ def config_metadata_model(
     if model not in valid:
         raise typer.BadParameter(f"model must be one of: {', '.join(valid)}")
     if backend:
-        if backend not in ("cli", "api"):
-            raise typer.BadParameter("backend must be 'cli' or 'api'")
+        try:
+            model, backend = validate_route(model, backend)
+        except ModelUnavailable as exc:
+            raise typer.BadParameter(str(exc)) from exc
         app_config.set_backend(model, backend)
     if model_id:
         app_config.set_model_id(model, model_id)
@@ -2009,11 +2399,10 @@ def config_backend(model: str, backend: str) -> None:
     """Set a model's backend: cli or api."""
     from core import app_config
 
-    if backend not in ("cli", "api"):
-        console.print("[red]backend must be 'cli' or 'api'[/red]")
-        raise typer.Exit(1)
-    if model not in PROVIDER_LABELS:
-        console.print(f"[red]model must be {' / '.join(PROVIDER_LABELS)}[/red]")
+    try:
+        model, backend = validate_route(model, backend)
+    except ModelUnavailable as exc:
+        console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
     app_config.set_backend(model, backend)
     console.print(f"[green]ok[/green] {model} -> {backend}")
@@ -2026,6 +2415,15 @@ def config_model(model: str, model_id: str) -> None:
 
     app_config.set_model_id(model, model_id)
     console.print(f"[green]ok[/green] {model} api model id -> {model_id}")
+
+
+@safe_command(name="config-folder-threshold")
+def config_folder_threshold(
+    value: float = typer.Argument(..., min=0.0, max=1.0),
+) -> None:
+    """Set when an explicitly approved model may arbitrate a weak local match."""
+    app_config.set_folder_llm_threshold(value)
+    console.print(f"[green]ok[/green] folder model threshold -> {value:.2f}")
 
 
 @safe_command(name="config-path")

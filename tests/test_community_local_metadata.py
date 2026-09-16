@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 
 
-def test_macos_community_surfaces_local_metadata_but_gates_private_actions() -> None:
+def test_macos_community_surfaces_local_metadata_and_opt_in_integrations() -> None:
     source = (ROOT / "app" / "Sources" / "PlaudNoteApp" / "ContentView.swift").read_text(
         encoding="utf-8"
     )
@@ -35,10 +35,20 @@ def test_macos_community_surfaces_local_metadata_but_gates_private_actions() -> 
     context_menu = source.split(".contextMenu {", 1)[1].split(".swipeActions(edge: .leading", 1)[0]
     private_gate = context_menu.index("if !DistributionProfile.isCommunity")
     assert private_gate < context_menu.index("store.sendToObsidian")
-    assert private_gate < context_menu.index("store.transcribeWithElevenLabs")
+    assert context_menu.index("store.sendToObsidian") < context_menu.index(
+        "store.transcribeWithElevenLabs"
+    )
+    assert 'Button("Transcribe with ElevenLabs…")' in context_menu
+
+    file_store = (ROOT / "app" / "Sources" / "PlaudNoteApp" / "FileStore.swift").read_text(
+        encoding="utf-8"
+    )
+    assert 'DistributionProfile.isCommunity ? "auto-folder" : "classify"' in file_store
+    assert '["--limit", "200", "--min-confidence", "0.6"]' in file_store
+    assert '["elevenlabs-transcribe", fileID, "--confirm-upload", "--json"]' in file_store
 
 
-def test_windows_ui_exposes_only_local_status_and_manual_tag_routes() -> None:
+def test_windows_ui_exposes_local_metadata_and_consent_gated_integrations() -> None:
     html = (ROOT / "windows_app" / "static" / "index.html").read_text(encoding="utf-8")
     javascript = (ROOT / "windows_app" / "static" / "app.js").read_text(encoding="utf-8")
 
@@ -57,11 +67,17 @@ def test_windows_ui_exposes_only_local_status_and_manual_tag_routes() -> None:
     assert 'api("/api/usage-status"' in javascript
     assert 'api("/api/tag-add"' in javascript
     assert 'api("/api/tag-remove"' in javascript
+    assert 'api("/api/folder-preview"' in javascript
+    assert 'api("/api/folder-apply"' in javascript
+    assert 'api("/api/elevenlabs-transcribe"' in javascript
+    assert "confirm_external: useAI" in javascript
+    assert "confirm_apply: true" in javascript
+    assert "confirm_upload: true" in javascript
+    assert 'provider === "gemini" || provider === "grok"' in javascript
     for unavailable_route in (
         "/api/metadata-generate",
         "/api/auto-classify",
         "/api/obsidian",
         "/api/dual",
-        "/api/folder-move",
     ):
         assert unavailable_route not in javascript

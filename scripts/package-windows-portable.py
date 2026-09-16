@@ -197,9 +197,25 @@ def stage_release(root: Path, stage: Path, version: str, commit: str, runtime_zi
 3. Windows opens the local interface in your default browser.
 4. Paste only an API cURL copied from your own Plaud Web session.
 
+The imported cURL contains a current access token and cannot create automatic
+refresh credentials. When it expires, import a fresh cURL from your own session.
+
 Credentials are encrypted for the current Windows account with DPAPI and saved
-under LocalAppData. The app reads Plaud Cloud data; it does not rename, delete,
-or otherwise edit cloud recordings. Backfill runs only after you press its button.
+under LocalAppData. Backfill runs only after you press its button. Folder routing
+previews first and changes only the exact existing-folder rows you select and
+confirm. It never creates a folder. The latest apply can be undone only when all
+local and Cloud folder states still match the applied targets; conflicts fail
+before the first change. The localhost server exits after the browser has not
+been visible for two minutes; an active job finishes before shutdown.
+
+Optional AI folder arbitration uses your own protected API key, or a signed-in
+Claude/Codex CLI, only after per-preview confirmation. Gemini and Grok are API-key
+only. ElevenLabs Scribe v2 uploads one selected recording only after confirmation
+and may consume paid credits. If a paid upload result is unknown, a local opaque
+marker blocks another upload until you explicitly accept possible duplicate
+billing. Handled exits remove private temporary audio; hard-exit leftovers older
+than six hours are scavenged by the next transcription. Provider keys are separate
+DPAPI-encrypted blobs.
 
 This unsigned community build may trigger Windows reputation protection. Do not
 disable SmartScreen or Smart App Control. Use it only when you received this

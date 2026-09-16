@@ -15,6 +15,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import secrets
 import sys
 import time
 from collections.abc import Iterator, Mapping
@@ -182,12 +183,16 @@ def _dpapi_unprotect(data: bytes) -> bytes:
 
 def _atomic_write_private(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    nonce = secrets.token_hex(8)
+    tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}-{nonce}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     fd = os.open(tmp_path, flags, 0o600)
     try:
         try:
-            os.write(fd, payload)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -197,9 +202,14 @@ def _atomic_write_private(path: Path, payload: bytes) -> None:
         raise
 
 
-def _native_read() -> str | None:
+def _native_read(
+    *,
+    service: str = KEYCHAIN_SERVICE,
+    account: str = KEYCHAIN_ACCOUNT,
+    windows_path: Path | None = None,
+) -> str | None:
     if sys.platform == "win32":
-        path = _windows_blob_path()
+        path = windows_path or _windows_blob_path()
         if not path.exists():
             return None
         try:
@@ -212,19 +222,26 @@ def _native_read() -> str | None:
     if sys.platform != "darwin":
         raise CredentialStoreError("native credential storage is unsupported on this platform")
     try:
-        return keychain_api.find_generic_password(
-            None, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, not_found_ok=True
-        )
+        return keychain_api.find_generic_password(None, service, account, not_found_ok=True)
     except keychain_api.Error as exc:
         raise CredentialStoreError("macOS Keychain denied credential access") from exc
 
 
-def _native_replace(payload: str) -> None:
+def _native_replace(
+    payload: str,
+    *,
+    service: str = KEYCHAIN_SERVICE,
+    account: str = KEYCHAIN_ACCOUNT,
+    windows_path: Path | None = None,
+) -> None:
     """Atomically replace the OS-protected credential payload."""
 
     if sys.platform == "win32":
         try:
-            _atomic_write_private(_windows_blob_path(), _dpapi_protect(payload.encode("utf-8")))
+            _atomic_write_private(
+                windows_path or _windows_blob_path(),
+                _dpapi_protect(payload.encode("utf-8")),
+            )
         except CredentialStoreError:
             raise
         except OSError as exc:
@@ -246,8 +263,8 @@ def _native_replace(payload: str) -> None:
     data = cf_data_create(None, buffer, len(encoded))
     query = keychain_api.create_query(
         kSecClass=keychain_api.k_("kSecClassGenericPassword"),
-        kSecAttrService=KEYCHAIN_SERVICE,
-        kSecAttrAccount=KEYCHAIN_ACCOUNT,
+        kSecAttrService=service,
+        kSecAttrAccount=account,
     )
     attributes = keychain_api.CFDictionaryCreate(
         None,
@@ -260,24 +277,29 @@ def _native_replace(payload: str) -> None:
     try:
         status = sec_item_update(query, attributes)
         if status == keychain_api.error.item_not_found:
-            keychain_api.set_generic_password(None, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, payload)
+            keychain_api.set_generic_password(None, service, account, payload)
             return
         keychain_api.Error.raise_for_status(status)
     except keychain_api.Error as exc:
         raise CredentialStoreError("macOS Keychain could not save credentials") from exc
 
 
-def _native_delete() -> None:
+def _native_delete(
+    *,
+    service: str = KEYCHAIN_SERVICE,
+    account: str = KEYCHAIN_ACCOUNT,
+    windows_path: Path | None = None,
+) -> None:
     if sys.platform == "win32":
         try:
-            _windows_blob_path().unlink(missing_ok=True)
+            (windows_path or _windows_blob_path()).unlink(missing_ok=True)
         except OSError as exc:
             raise CredentialStoreError("Windows could not remove encrypted credentials") from exc
         return
     if sys.platform != "darwin":
         raise CredentialStoreError("native credential storage is unsupported on this platform")
     try:
-        keychain_api.delete_generic_password(None, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        keychain_api.delete_generic_password(None, service, account)
     except keychain_api.NotFound:
         return
     except keychain_api.Error as exc:

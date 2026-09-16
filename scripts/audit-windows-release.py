@@ -65,6 +65,11 @@ def audit_directory(root: Path) -> int:
         "runtime/python313.zip",
         "runtime/python313._pth",
         "app/core/secret_store.py",
+        "app/core/provider_secrets.py",
+        "app/core/community_models.py",
+        "app/core/_windows_job_runner.py",
+        "app/core/community_router.py",
+        "app/core/transcribe.py",
         "app/windows_app/__main__.py",
         "app/windows_app/launcher.py",
         "app/windows_app/server.py",
@@ -101,7 +106,9 @@ def audit_directory(root: Path) -> int:
             forbidden.append(rel)
         elif lowered.endswith(".pth") and lowered != "python313._pth":
             forbidden.append(rel)
-        elif lowered.endswith((".mp3", ".m4a", ".wav", ".aac", ".flac", ".mp4", ".mov")):
+        elif lowered.endswith(
+            (".mp3", ".opus", ".ogg", ".m4a", ".wav", ".aac", ".flac", ".mp4", ".mov")
+        ):
             forbidden.append(rel)
     audit.check(
         not forbidden,
@@ -138,6 +145,16 @@ def audit_directory(root: Path) -> int:
         encoding="utf-8"
     )
     launcher_source = (root / "app" / "windows_app" / "launcher.py").read_text(encoding="utf-8")
+    service_source = (root / "app" / "windows_app" / "service.py").read_text(encoding="utf-8")
+    model_source = (root / "app" / "core" / "community_models.py").read_text(encoding="utf-8")
+    job_runner_source = (root / "app" / "core" / "_windows_job_runner.py").read_text(
+        encoding="utf-8"
+    )
+    router_source = (root / "app" / "core" / "community_router.py").read_text(encoding="utf-8")
+    transcribe_source = (root / "app" / "core" / "transcribe.py").read_text(encoding="utf-8")
+    provider_secret_source = (root / "app" / "core" / "provider_secrets.py").read_text(
+        encoding="utf-8"
+    )
     runtime_paths = (root / "runtime" / "python313._pth").read_text(encoding="ascii")
     start_command = (root / "Start Plaud Community.cmd").read_text(encoding="ascii")
     audit.check(
@@ -155,6 +172,159 @@ def audit_directory(root: Path) -> int:
         and "history.replaceState" in browser_source,
         "Loopback UI requires a fragment-delivered session token and restrictive headers.",
         "The loopback session-token security markers are incomplete.",
+    )
+    audit.check(
+        all(
+            marker in server_source
+            for marker in (
+                "STARTUP_GRACE_SECONDS = 120.0",
+                "BROWSER_IDLE_TIMEOUT_SECONDS = 120.0",
+                "REQUEST_SOCKET_TIMEOUT_SECONDS = 30.0",
+                "connection.settimeout",
+                "note_browser_heartbeat",
+                "start_idle_monitor",
+                '"/api/heartbeat"',
+                "_active_api_requests",
+                "prepare_shutdown",
+                "server_close",
+            )
+        )
+        and all(
+            marker in browser_source
+            for marker in (
+                "HEARTBEAT_INTERVAL_MS",
+                "document.visibilityState",
+                'document.addEventListener("visibilitychange"',
+                'window.addEventListener("pagehide"',
+            )
+        )
+        and all(marker in service_source for marker in ("_job_gate", "prepare_shutdown")),
+        "Browser lease expiry and active-work shutdown deferral are present.",
+        "Windows idle-shutdown lifecycle markers are incomplete.",
+    )
+    audit.check(
+        all(
+            marker in router_source
+            for marker in (
+                "expected_plan_id",
+                "compare_digest",
+                "file_detail",
+                "DEFAULT_PREVIEW_MAX_AGE_SECONDS",
+                "apply_journal_path",
+                "undo_journal_path",
+                "reconcile_apply_journal",
+                "reconcile_undo_journal",
+                "_mutation_error_is_ambiguous",
+                "_validate_committed_apply_manifest",
+                "replace_undo_manifest",
+            )
+        )
+        and all(
+            marker in service_source
+            for marker in (
+                "confirm_external",
+                "confirm_apply",
+                "confirm_undo",
+                "expected_plan_id=plan_id",
+                "undo_saved_manifest",
+            )
+        ),
+        "Folder routing is preview-bound, remotely revalidated, journaled, and undoable.",
+        "Folder-routing mutation gates are incomplete.",
+    )
+    audit.check(
+        all(
+            marker in server_source
+            for marker in ('"/api/folder-undo"', '"confirm_undo"', 'raw.decode("utf-8")')
+        )
+        and all(
+            marker in browser_source
+            for marker in (
+                'api("/api/folder-undo"',
+                "confirm_undo: true",
+                "undoAvailable",
+            )
+        ),
+        "Windows UI exposes confirmed safe undo and rejects non-UTF-8 JSON.",
+        "Windows undo or strict JSON-decoding markers are incomplete.",
+    )
+    audit.check(
+        all(
+            marker in model_source
+            for marker in (
+                "--no-session-persistence",
+                "--strict-mcp-config",
+                "--ignore-user-config",
+                "shell_tool",
+                "API_ONLY_PROVIDERS",
+                "trust_env=False",
+                "follow_redirects=False",
+            )
+        )
+        and all(
+            marker in transcribe_source
+            for marker in (
+                "https://api.elevenlabs.io/v1/speech-to-text",
+                "confirm_upload",
+                "MAX_AUDIO_BYTES",
+                "follow_redirects=False",
+                "trust_env=False",
+            )
+        )
+        and all(
+            marker in provider_secret_source
+            for marker in (
+                "_provider_secret_lock",
+                "O_NOFOLLOW",
+                "stat.S_ISREG",
+                "secret_disclosed",
+            )
+        )
+        and all(
+            marker in transcribe_source
+            for marker in (
+                "_transcription_lock",
+                "O_NOFOLLOW",
+                "stat.S_ISREG",
+                "another transcription was already in progress",
+            )
+        ),
+        "Optional provider paths retain consent, no-tool, host, lock, and protected-secret gates.",
+        "Optional provider security markers are incomplete.",
+    )
+    audit.check(
+        all(
+            marker in model_source
+            for marker in (
+                "_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
+                "SetInformationJobObject",
+                "AssignProcessToJobObject",
+                "TerminateJobObject",
+                "_WINDOWS_JOB_START_GATE",
+                "_windows_job_runner.py",
+                '"-I"',
+                '"-S"',
+                '"-B"',
+                '_windows_system_executable("taskkill.exe")',
+                '"/T"',
+                '"/F"',
+                "shell=False",
+            )
+        )
+        and all(
+            marker in job_runner_source
+            for marker in (
+                "sys.stdin.buffer.read()",
+                "gated_input.startswith(_START_GATE)",
+                "subprocess.Popen",
+                "shell=False",
+                "close_fds=True",
+            )
+        )
+        and job_runner_source.index("sys.stdin.buffer.read()")
+        < job_runner_source.index("subprocess.Popen"),
+        "Provider CLIs are gated into kill-on-close Windows Jobs before launch.",
+        "Windows provider process-tree cleanup markers are incomplete.",
     )
     audit.check(
         all(

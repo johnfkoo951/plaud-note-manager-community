@@ -33,9 +33,10 @@ The Windows static release audit must verify:
 - no `.env`, `auth.bin`, database, recording, test, cache, or developer path is bundled
 - exactly the three public templates are included
 - loopback-only server, fragment-delivered session token, authenticated API header, CSP, and `no-store` markers remain present
+- authenticated browser heartbeat expires after the documented lease, visible activity renews it, active jobs defer shutdown, and cleanup closes the server socket
 - ZIP members have one expected root, no traversal, case-fold collision, or symbolic link
 
-The packaged Windows native self-test must run on Windows 11 x64. It checks the HTTP session boundary and a 16 KiB synthetic DPAPI encrypt/read/delete round trip. Running it on macOS can check the HTTP path but must report DPAPI as skipped.
+The packaged Windows native self-test must run on Windows 11 x64. It checks the HTTP session boundary, browser-lease heartbeat, and a 16 KiB synthetic DPAPI encrypt/read/delete round trip. Running it on macOS can check the HTTP path but must report DPAPI as skipped.
 
 ## Live gates that require a test Plaud account
 

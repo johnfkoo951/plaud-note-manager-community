@@ -14,6 +14,10 @@
 - [ ] `scripts/package-macos-app.sh`와 `scripts/package-macos-intel.sh` 통과
 - [ ] `python3 scripts/package-windows-portable.py` 정적 감사 통과
 - [ ] 실제 Windows 11 x64에서 packaged HTTP·DPAPI 자가진단 통과
+- [ ] Windows 브라우저 탭 종료 2분 후 서버 프로세스 종료 및 진행 중 작업 완료 후 종료 확인
+- [ ] 폴더 미리보기는 Cloud를 바꾸지 않고, 선택 적용·30분 만료·폴더 변경·정확한 되돌리기를 소수 테스트 녹음으로 확인
+- [ ] Claude/Codex CLI 로그인 및 공급자별 API key 저장/삭제 상태만 보이고 값은 노출되지 않음을 확인
+- [ ] ElevenLabs 테스트 녹음 1건의 업로드 확인·중복 업로드 차단·로컬 결과 저장을 확인
 - [ ] 최종 앱에 `.env`, DB, 로그, 테스트 fixture, `.git`이 없음
 - [ ] 앱 바이너리/런타임에서 빌드 사용자 홈 경로와 개인 볼트명이 검출되지 않음
 - [ ] ZIP SHA-256 확인
@@ -34,9 +38,10 @@
 ## 19:30–20:00 설치와 안전 경계
 
 - [ ] 체크섬 확인 후 설치
-- [ ] Community판 저장 위치와 외부 AI 비활성화 설명
+- [ ] Community판 저장 위치와 외부 AI/ElevenLabs의 기본 비활성·매 실행 확인·비용 가능성 설명
 - [ ] macOS는 앱 내 Web Login을 우선하고, 멈추면 인증 창의 cURL 폴백 사용. Windows는 로컬 화면의 cURL 가져오기
 - [ ] Sync로 목록만 먼저 확인
+- [ ] 로컬 전용 폴더 미리보기를 먼저 실행하고 AI 미리보기는 동의한 테스트 자료에만 사용
 
 ## 20:00–21:00 수집
 

@@ -34,6 +34,16 @@ def test_community_edition_keeps_local_paths_command_available() -> None:
     assert "templates" in result.stdout
 
 
+@pytest.mark.parametrize(
+    "command",
+    ["auto-folder", "provider-key-status", "elevenlabs-transcribe"],
+)
+def test_community_edition_registers_opt_in_integration_commands(command: str) -> None:
+    result = CliRunner().invoke(app, [command, "--help"])
+
+    assert result.exit_code == 0, result.output
+
+
 def test_macos_community_exposes_manual_curl_fallback() -> None:
     source = (
         Path(__file__).parents[1] / "app" / "Sources" / "PlaudNoteApp" / "PlaudAuthSheet.swift"

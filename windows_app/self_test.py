@@ -105,6 +105,8 @@ def _request(
     path: str,
     *,
     token: str | None = None,
+    method: str = "GET",
+    body: bytes | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
     connection = http.client.HTTPConnection(
         "127.0.0.1",
@@ -112,7 +114,9 @@ def _request(
         timeout=3,
     )
     headers = {SESSION_HEADER: token} if token is not None else {}
-    connection.request("GET", path, headers=headers)
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    connection.request(method, path, body=body, headers=headers)
     response = connection.getresponse()
     body = response.read()
     response_headers = dict(response.getheaders())
@@ -149,10 +153,19 @@ def run_self_test() -> int:
             "/api/status",
             token=token,
         )
+        heartbeat_status, _, heartbeat_body = _request(
+            server,
+            "/api/heartbeat",
+            token=token,
+            method="POST",
+            body=b"{}",
+        )
         static_status, static_headers, static_body = _request(server, "/")
         status_payload = json.loads(api_body)
         if unauthenticated != 401 or authenticated != 200:
             raise RuntimeError("API authentication failed")
+        if heartbeat_status != 200 or json.loads(heartbeat_body).get("status") != "alive":
+            raise RuntimeError("browser lease heartbeat failed")
         if status_payload.get("self_test") is not True:
             raise RuntimeError("API dispatch failed")
         if static_status != 200 or b"/assets/app.js" not in static_body:

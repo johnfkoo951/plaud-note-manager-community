@@ -886,7 +886,7 @@ final class Database: @unchecked Sendable {
 
     private func parseAppConfig(path: String) -> AppConfig {
         let defaults = AppConfig(
-            backends: ["claude": "cli", "codex": "cli", "gemini": "cli",
+            backends: ["claude": "cli", "codex": "cli", "gemini": "api",
                        "grok": "api"],
             models: Self.fallbackModelIDs,
             paths: ["transcripts": "", "summaries": "", "integrated": ""],

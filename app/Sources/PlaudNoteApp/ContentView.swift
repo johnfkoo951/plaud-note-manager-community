@@ -585,19 +585,17 @@ struct ContentView: View {
                 }
                 .help("Pre-cache transcripts + summaries for every file so clicks are instant.")
 
-                if !DistributionProfile.isCommunity {
-                    Button {
-                        Task { await store.classifyPreview() }
-                    } label: {
-                        if store.classifyRunning {
-                            ToolbarProgressLabel(text: nil)
-                        } else {
-                            ToolbarIconLabel(systemName: "wand.and.stars")
-                        }
+                Button {
+                    Task { await store.classifyPreview() }
+                } label: {
+                    if store.classifyRunning {
+                        ToolbarProgressLabel(text: nil)
+                    } else {
+                        ToolbarIconLabel(systemName: "wand.and.stars")
                     }
-                    .disabled(store.classifyRunning)
-                    .help("Auto-classify recordings into folders — preview before applying (App-only capability).")
                 }
+                .disabled(store.classifyRunning)
+                .help("Suggest one of your existing Plaud folders, then preview before applying.")
 
                 Button {
                     Task { await store.sync() }
@@ -615,7 +613,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showSettings) {
             if DistributionProfile.isCommunity {
-                CommunitySettingsSheet { showSettings = false }
+                CommunitySettingsSheet(store: store) { showSettings = false }
             } else {
                 SettingsSheet(store: store) { showSettings = false }
             }
@@ -647,11 +645,15 @@ struct ContentView: View {
         }
         .sheet(isPresented: Binding(
             get: { store.classifyPlans != nil },
-            set: { if !$0 { store.classifyPlans = nil } }
+            set: { if !$0 { store.dismissClassifyPreview() } }
         )) {
             if let plans = store.classifyPlans {
-                ClassifyPreviewSheet(store: store, plans: plans) {
-                    store.classifyPlans = nil
+                ClassifyPreviewSheet(
+                    store: store,
+                    plans: plans,
+                    planID: store.classifyPlanID
+                ) {
+                    store.dismissClassifyPreview()
                 }
             }
         }
@@ -661,18 +663,24 @@ struct ContentView: View {
 // MARK: - Classify Preview Sheet
 
 /// Preview-before-apply for auto-classification. Lists the dry-run plans
-/// sorted by confidence, pre-checks confident matches (>= 0.5), and applies
+/// sorted by confidence, pre-checks confident matches, and applies
 /// only the rows the user keeps checked.
 private struct ClassifyPreviewSheet: View {
     @ObservedObject var store: FileStore
     let plans: [FileStore.ClassifyPlan]
+    let planID: String?
     let dismiss: () -> Void
 
-    /// File ids the user has selected to apply. Seeded from confidence >= 0.5.
+    /// File ids the user has selected to apply. Community uses the same 0.6
+    /// threshold as the guarded Python apply path.
     @State private var checked: Set<String> = []
 
+    private var minimumConfidence: Double {
+        DistributionProfile.isCommunity ? 0.6 : 0.5
+    }
+
     private var lowConfidenceCount: Int {
-        plans.filter { $0.confidence < 0.5 }.count
+        plans.filter { $0.confidence < minimumConfidence }.count
     }
     private var targetFolderCount: Int {
         Set(plans.filter { checked.contains($0.fileID) }.map { $0.folderName }).count
@@ -718,20 +726,29 @@ private struct ClassifyPreviewSheet: View {
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("적용 (\(checked.count)개)") {
-                    let ids = Array(checked)
+                    let ids = checked.sorted()
+                    let approvedPlanID = planID
                     dismiss()
-                    Task { await store.applyClassify(fileIDs: ids) }
+                    Task {
+                        await store.applyClassify(
+                            fileIDs: ids,
+                            planID: approvedPlanID
+                        )
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
                 .controlSize(.large)
-                .disabled(checked.isEmpty || store.classifyRunning)
+                .disabled(
+                    checked.isEmpty || store.classifyRunning
+                        || (DistributionProfile.isCommunity && planID == nil)
+                )
             }
             .padding(.horizontal, AppUI.spacingXL)
             .padding(.vertical, 14)
         }
         .frame(width: 640, height: 560)
         .onAppear {
-            checked = Set(plans.filter { $0.confidence >= 0.5 }.map { $0.fileID })
+            checked = Set(plans.filter { $0.confidence >= minimumConfidence }.map { $0.fileID })
         }
     }
 
@@ -741,7 +758,9 @@ private struct ClassifyPreviewSheet: View {
 
     private func planRow(_ plan: FileStore.ClassifyPlan) -> some View {
         let isChecked = checked.contains(plan.fileID)
+        let isEligible = plan.confidence >= minimumConfidence
         return Button {
+            guard isEligible else { return }
             if isChecked { checked.remove(plan.fileID) }
             else { checked.insert(plan.fileID) }
         } label: {
@@ -762,6 +781,16 @@ private struct ClassifyPreviewSheet: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
+                    if DistributionProfile.isCommunity {
+                        let source = plan.source == "llm" ? "AI" : "로컬"
+                        let detail = [source, plan.reason, plan.error]
+                            .filter { !$0.isEmpty }
+                            .joined(separator: " · ")
+                        Text(detail)
+                            .font(.system(size: 10))
+                            .foregroundStyle(plan.error.isEmpty ? Color.secondary : Color.orange)
+                            .lineLimit(2)
+                    }
                 }
                 Spacer(minLength: 8)
                 confidencePill(plan.confidence)
@@ -772,12 +801,13 @@ private struct ClassifyPreviewSheet: View {
             .help(plan.reason.isEmpty ? plan.folderName : plan.reason)
         }
         .buttonStyle(.plain)
+        .disabled(!isEligible)
     }
 
     private func confidencePill(_ value: Double) -> some View {
         let pct = Int((value * 100).rounded())
         let color: Color = value >= 0.7 ? AnuPalette.green
-            : (value >= 0.5 ? AnuPalette.yellow : Color.gray)
+            : (value >= minimumConfidence ? AnuPalette.yellow : Color.gray)
         return Text("\(pct)%")
             .font(.system(size: 11, weight: .bold))
             .foregroundStyle(color)
@@ -1730,10 +1760,11 @@ private struct FileListView: View {
                                 Button("Send to Obsidian") {
                                     Task { await store.sendToObsidian(file.id) }
                                 }
-                                Button("Transcribe with ElevenLabs") {
-                                    Task { await store.transcribeWithElevenLabs(file.id) }
-                                }
                             }
+                            Button("Transcribe with ElevenLabs…") {
+                                Task { await store.transcribeWithElevenLabs(file.id) }
+                            }
+                            .disabled(store.transcribingIDs.contains(file.id))
                         }
                         .swipeActions(edge: .leading, allowsFullSwipe: true) {
                             // Toggle archived <-> unused via the existing
@@ -1794,7 +1825,9 @@ private struct FileListView: View {
         }
         // Selecting a recording dismisses the auto-classify undo banner.
         .onChange(of: store.selectedID) { _, _ in
-            store.lastClassifyApply = nil
+            if !DistributionProfile.isCommunity, !store.classifyUndoNeedsRetry {
+                store.dismissClassifyUndo()
+            }
         }
     }
 
@@ -1831,28 +1864,41 @@ private struct ClassifyUndoBanner: View {
             Image(systemName: "wand.and.stars")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(AppUI.accentPink)
-            Text("\(store.lastClassifyApply?.count ?? 0)개 자동 분류됨")
+            Text(
+                store.classifyApplyRecoveryRequired
+                    ? "중단된 폴더 적용 (store.lastClassifyApply?.count ?? 0)개 복구 필요"
+                    : store.classifyUndoNeedsRetry
+                    ? "\(store.lastClassifyApply?.count ?? 0)개 되돌리기 재시도 필요"
+                    : "\(store.lastClassifyApply?.count ?? 0)개 자동 분류됨"
+            )
                 .font(.system(size: 12, weight: .medium))
                 .lineLimit(1)
             Spacer(minLength: 6)
             Button {
                 Task { await store.classifyUndo() }
             } label: {
-                Label("되돌리기", systemImage: "arrow.uturn.backward")
+                Label(
+                    store.classifyApplyRecoveryRequired
+                        ? "상태 안정화"
+                        : store.classifyUndoNeedsRetry ? "재시도" : "되돌리기",
+                    systemImage: "arrow.uturn.backward"
+                )
                     .font(.system(size: 11.5, weight: .semibold))
             }
             .buttonStyle(.plain)
             .foregroundStyle(Color.accentColor)
             .disabled(store.classifyRunning)
-            Button {
-                store.lastClassifyApply = nil
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(.tertiary)
+            if !DistributionProfile.isCommunity {
+                Button {
+                    store.dismissClassifyUndo()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("배너 닫기")
             }
-            .buttonStyle(.plain)
-            .help("배너 닫기")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
@@ -1862,11 +1908,13 @@ private struct ClassifyUndoBanner: View {
                 .stroke(AppUI.accentPink.opacity(0.30), lineWidth: 1)
         )
         .task(id: store.lastClassifyApply?.at) {
+            guard !DistributionProfile.isCommunity else { return }
             // Auto-dismiss after ~12s unless replaced by a newer apply.
             let stamp = store.lastClassifyApply?.at
             try? await Task.sleep(nanoseconds: 12_000_000_000)
-            if store.lastClassifyApply?.at == stamp {
-                store.lastClassifyApply = nil
+            if store.lastClassifyApply?.at == stamp,
+               !store.classifyUndoNeedsRetry {
+                store.dismissClassifyUndo()
             }
         }
     }
@@ -3020,6 +3068,11 @@ private enum SourceTab: String, CaseIterable, Identifiable {
     case cmds = "CMDS"
     case final = "Final"
     var id: String { rawValue }
+
+    var title: String {
+        if DistributionProfile.isCommunity, self == .cmds { return "ElevenLabs" }
+        return rawValue
+    }
 }
 
 private struct SidebarTogglePill: View {
@@ -3296,7 +3349,7 @@ private struct DetailView: View {
         VStack(alignment: .leading, spacing: 0) {
             header(file: file)
             audioBar(file: file)
-            if !DistributionProfile.isCommunity {
+            if !availableSourceTabs.isEmpty {
                 sourceSwitcher
                     .padding(.horizontal, 12)
                     .padding(.bottom, 6)
@@ -3311,17 +3364,21 @@ private struct DetailView: View {
         }
     }
 
+    private var availableSourceTabs: [SourceTab] {
+        DistributionProfile.isCommunity ? [.plaud, .cmds] : SourceTab.allCases
+    }
+
     private var sourceSwitcher: some View {
         HStack(spacing: 8) {
             Text("Source")
                 .font(AppUI.sectionFont)
                 .foregroundStyle(.secondary)
             HStack(spacing: 2) {
-                ForEach(SourceTab.allCases) { source in
+                ForEach(availableSourceTabs) { source in
                     Button {
                         sourceTab = source
                     } label: {
-                        Text(source.rawValue)
+                        Text(source.title)
                             .font(AppUI.controlFont)
                             .foregroundStyle(sourceTab == source ? .primary : .secondary)
                             .frame(width: 78)
@@ -4662,10 +4719,12 @@ private struct CmdsPanel: View {
                     controlBar
                     Divider()
                     if let cmds = store.cmdsTranscript, !cmds.isEmpty {
-                        if sections.count > 1 {
-                            sectionRelabelBars
-                        } else {
-                            flatRelabelBar
+                        if !DistributionProfile.isCommunity {
+                            if sections.count > 1 {
+                                sectionRelabelBars
+                            } else {
+                                flatRelabelBar
+                            }
                         }
                         if (ContentViewMode(rawValue: viewModeRaw) ?? .rendered) == .raw {
                             RawTextView(wrapLines: wrapLines, text: cmds)
@@ -4681,7 +4740,9 @@ private struct CmdsPanel: View {
                         )
                     } else {
                         CenteredStateView(
-                            message: "No CMDS transcript yet — set speaker count above and click Transcribe."
+                            message: DistributionProfile.isCommunity
+                                ? "No ElevenLabs transcript yet — set speaker count above and click Transcribe."
+                                : "No CMDS transcript yet — set speaker count above and click Transcribe."
                         )
                     }
                 }
@@ -4703,7 +4764,11 @@ private struct CmdsPanel: View {
 
     private var headerBar: some View {
         HStack(spacing: 8) {
-            Label("CMDS · ElevenLabs Scribe", systemImage: "person.wave.2")
+            Label(
+                DistributionProfile.isCommunity
+                    ? "ElevenLabs Scribe transcript" : "CMDS · ElevenLabs Scribe",
+                systemImage: "person.wave.2"
+            )
                 .font(AppUI.sectionFont)
                 .foregroundStyle(.secondary)
             Spacer()
@@ -4733,7 +4798,11 @@ private struct CmdsPanel: View {
             }
         } label: {
             Image(systemName: "doc.on.clipboard")
-                .help("Copy CMDS package to clipboard")
+                .help(
+                    DistributionProfile.isCommunity
+                        ? "Copy ElevenLabs transcript package to clipboard"
+                        : "Copy CMDS package to clipboard"
+                )
         }
         .menuStyle(.borderlessButton)
         .frame(width: 32)
@@ -4771,7 +4840,7 @@ private struct CmdsPanel: View {
             }
             .frame(width: 110)
             .help("0 = Auto (ElevenLabs decides). 1-10 = pin to that count.")
-            Button("Transcribe with ElevenLabs") {
+            Button("Transcribe with ElevenLabs…") {
                 if let fid = store.selectedID {
                     Task { await store.transcribeWithElevenLabs(fid,
                                                                 numSpeakers: numSpeakers) }
@@ -4779,18 +4848,26 @@ private struct CmdsPanel: View {
             }
             .disabled(store.selectedID.map { store.transcribingIDs.contains($0) } ?? true)
 
-            Divider().frame(height: 18)
-            Text("Conv. gap:")
-            Stepper(value: $gapSeconds, in: 3...60, step: 1) {
-                Text("\(Int(gapSeconds))s")
+            if !DistributionProfile.isCommunity {
+                Divider().frame(height: 18)
+                Text("Conv. gap:")
+                Stepper(value: $gapSeconds, in: 3...60, step: 1) {
+                    Text("\(Int(gapSeconds))s")
+                }
+                .frame(width: 100)
+                .help("Silence gap (seconds) that splits one recording into multiple "
+                      + "conversations. Each conversation gets its own speaker mapping.")
             }
-            .frame(width: 100)
-            .help("Silence gap (seconds) that splits one recording into multiple "
-                  + "conversations. Each conversation gets its own speaker mapping.")
 
             Spacer()
-            Button("Manage saved speakers") { managingSpeakers = true }
-                .buttonStyle(.borderless)
+            if !DistributionProfile.isCommunity {
+                Button("Manage saved speakers") { managingSpeakers = true }
+                    .buttonStyle(.borderless)
+            } else {
+                Text("Audio is uploaded only after confirmation; ElevenLabs credits may be used.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

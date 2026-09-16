@@ -7,6 +7,7 @@ import logging
 import random
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,13 @@ from .models import (
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TempAudioSource:
+    url: str
+    filename: str
+    content_type: str
 
 
 class PlaudAPIError(RuntimeError):
@@ -234,14 +242,32 @@ class PlaudClient:
     def file_detail(self, file_id: str) -> dict[str, Any]:
         return self._get_json(f"/file/detail/{file_id}")
 
-    def temp_url(self, file_id: str) -> str:
+    def temp_audio_source(self, file_id: str) -> TempAudioSource:
+        """Return the preferred short-lived audio URL and truthful media metadata."""
+
         data = self._get_json(f"/file/temp-url/{file_id}")
-        # Prefer the regular (mp3) URL for AVPlayer/codec compatibility, matching
-        # cli.audio_url and core.transcribe; fall back to opus when absent.
-        url = data.get("temp_url") or data.get("temp_url_opus")
-        if not url:
-            raise PlaudAPIError(f"missing temp_url for {file_id}")
-        return url
+        # Prefer MP3 for broad player/provider compatibility. When Plaud only
+        # supplies Opus, do not disguise its filename or content type as MP3.
+        mp3_url = data.get("temp_url")
+        if isinstance(mp3_url, str) and mp3_url:
+            return TempAudioSource(
+                url=mp3_url,
+                filename="recording.mp3",
+                content_type="audio/mpeg",
+            )
+        opus_url = data.get("temp_url_opus")
+        if isinstance(opus_url, str) and opus_url:
+            return TempAudioSource(
+                url=opus_url,
+                filename="recording.opus",
+                content_type="audio/ogg",
+            )
+        raise PlaudAPIError(f"missing temp_url for {file_id}")
+
+    def temp_url(self, file_id: str) -> str:
+        """Return only the preferred audio URL (backward-compatible helper)."""
+
+        return self.temp_audio_source(file_id).url
 
     def file_content(self, file_id: str) -> FileContent:
         """Fetch detail + dereference S3 content links into structured content."""
@@ -354,12 +380,37 @@ class PlaudClient:
         Plaud web renders at most ONE folder per file — pushing multiple
         filetag ids corrupts the web UI, so we hard-reject it here.
         """
+        self._validate_file_folder_assignment(folder_ids)
+        self._patch_json(f"/file/{file_id}", {"filetag_id_list": folder_ids})
+
+    def set_file_folders_once(self, file_id: str, folder_ids: list[str]) -> None:
+        """Assign folders with exactly one HTTP attempt.
+
+        Crash-safe routing owns retries in its write-ahead journal and must
+        re-read the authoritative folder immediately before every attempt.
+        Calling the general retrying PATCH helper here would bypass that check
+        and could overwrite a concurrent Plaud web/mobile move.
+        """
+
+        self._validate_file_folder_assignment(folder_ids)
+        path = f"/file/{file_id}"
+        resp = self._request("PATCH", path, json={"filetag_id_list": folder_ids})
+        data = _safe_json(resp, f"PATCH {path}")
+        status = data.get("status")
+        if status not in (0, "0", None):
+            msg = data.get("msg") or data.get("error") or "unknown Plaud error"
+            raise _note_rejection(
+                PlaudAPIError(f"Plaud API error ({status}): {msg}", api_status=status),
+                record_auth_rejections=self._record_auth_rejections,
+            )
+
+    @staticmethod
+    def _validate_file_folder_assignment(folder_ids: list[str]) -> None:
         if len(folder_ids) > 1:
             raise ValueError(
                 "Plaud supports a single folder per file; got "
                 f"{len(folder_ids)}: {', '.join(folder_ids)}"
             )
-        self._patch_json(f"/file/{file_id}", {"filetag_id_list": folder_ids})
 
     def rename_file(self, file_id: str, name: str) -> None:
         self._patch_json(f"/file/{file_id}", {"filename": name})
